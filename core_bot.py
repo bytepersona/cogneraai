@@ -75,6 +75,9 @@ class ModerationBot(commands.Bot):
         try:
             if guild_id is not None:
                 g = discord.Object(id=guild_id)
+                # Cogs tragen App-Commands als *globale* Tree-Commands ein. `tree.sync(guild=…)`
+                # sendet nur den Guild-Bucket — ohne copy_global_to wäre der leer → 0 Befehle.
+                self.tree.copy_global_to(guild=g)
                 synced = await self.tree.sync(guild=g)
                 logger.info("Slash-Commands synchronisiert (Guild %s): %d Befehle", guild_id, len(synced))
             else:
