@@ -19,6 +19,7 @@ import aiosqlite
 
 from utils.config import Settings
 from utils.strike_escalation import default_strike_escalation_json
+from utils.url_allowlist import default_url_allowlist
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ class StoredMessage:
     content: str
     created_at_iso: str
     message_id: int
+    event_ref: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class ModLogEntry:
     reason: str
     details: str | None
     created_at_iso: str
+    case_ref: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class ReviewQueueEntry:
     status: str
     created_at_iso: str
     jump_url: Optional[str]
+    case_ref: Optional[str] = None
 
 
 class ModerationDatabase:
@@ -83,6 +87,54 @@ class ModerationDatabase:
             await _migrate_schema(db)
             await db.commit()
         logger.info("Datenbank bereit: %s", self._db_path)
+
+    async def allocate_case_ref(self, guild_id: int) -> str:
+        """Eindeutige Fall-ID pro Server (Moderationsfälle / Logs)."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT case_seq FROM guild_sequences WHERE guild_id = ?",
+                (guild_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                n = 1
+                await db.execute(
+                    "INSERT INTO guild_sequences (guild_id, case_seq, event_seq) VALUES (?, 1, 0)",
+                    (guild_id,),
+                )
+            else:
+                n = int(row[0]) + 1
+                await db.execute(
+                    "UPDATE guild_sequences SET case_seq = ? WHERE guild_id = ?",
+                    (n, guild_id),
+                )
+            await db.commit()
+        return f"CASE-{guild_id}-{n}"
+
+    async def allocate_event_ref(self, guild_id: int) -> str:
+        """Ereignis-ID für gespeicherte Nachrichten (Nachrichten-Kontext)."""
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cur = await db.execute(
+                "SELECT event_seq FROM guild_sequences WHERE guild_id = ?",
+                (guild_id,),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                n = 1
+                await db.execute(
+                    "INSERT INTO guild_sequences (guild_id, case_seq, event_seq) VALUES (?, 0, 1)",
+                    (guild_id,),
+                )
+            else:
+                n = int(row[0]) + 1
+                await db.execute(
+                    "UPDATE guild_sequences SET event_seq = ? WHERE guild_id = ?",
+                    (n, guild_id),
+                )
+            await db.commit()
+        return f"EVT-{guild_id}-{n}"
 
     async def get_guild_config(self, guild_id: int) -> dict[str, Any]:
         async with aiosqlite.connect(self._db_path) as db:
@@ -114,6 +166,11 @@ class ModerationDatabase:
         review_queue_enabled: bool | None = None,
         review_confidence_floor: int | None = None,
         report_channel_id: Any = _UNSET,
+        url_scan_enabled: bool | None = None,
+        url_allowlist_domains: list[str] | None = None,
+        vt_malicious_threshold: int | None = None,
+        vt_suspicious_threshold: int | None = None,
+        mod_embed_delete_after_seconds: Any = _UNSET,
     ) -> None:
         current = await self.get_guild_config(guild_id)
         merged = {
@@ -153,6 +210,21 @@ class ModerationDatabase:
             "report_channel_id": current["report_channel_id"]
             if report_channel_id is _UNSET
             else report_channel_id,
+            "url_scan_enabled": url_scan_enabled
+            if url_scan_enabled is not None
+            else current["url_scan_enabled"],
+            "url_allowlist_domains": url_allowlist_domains
+            if url_allowlist_domains is not None
+            else current["url_allowlist_domains"],
+            "vt_malicious_threshold": vt_malicious_threshold
+            if vt_malicious_threshold is not None
+            else current["vt_malicious_threshold"],
+            "vt_suspicious_threshold": vt_suspicious_threshold
+            if vt_suspicious_threshold is not None
+            else current["vt_suspicious_threshold"],
+            "mod_embed_delete_after_seconds": current.get("mod_embed_delete_after_seconds")
+            if mod_embed_delete_after_seconds is _UNSET
+            else mod_embed_delete_after_seconds,
         }
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
@@ -162,8 +234,11 @@ class ModerationDatabase:
                     mod_log_channel_id, whitelist_user_ids, whitelist_role_ids,
                     whitelist_channel_ids, ai_enabled,
                     dry_run, strike_escalation_enabled, strike_escalation_json,
-                    review_queue_enabled, review_confidence_floor, report_channel_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    review_queue_enabled, review_confidence_floor, report_channel_id,
+                    url_scan_enabled, url_allowlist_domains,
+                    vt_malicious_threshold, vt_suspicious_threshold,
+                    mod_embed_delete_after_seconds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     server_rules = excluded.server_rules,
                     confidence_threshold = excluded.confidence_threshold,
@@ -178,7 +253,12 @@ class ModerationDatabase:
                     strike_escalation_json = excluded.strike_escalation_json,
                     review_queue_enabled = excluded.review_queue_enabled,
                     review_confidence_floor = excluded.review_confidence_floor,
-                    report_channel_id = excluded.report_channel_id
+                    report_channel_id = excluded.report_channel_id,
+                    url_scan_enabled = excluded.url_scan_enabled,
+                    url_allowlist_domains = excluded.url_allowlist_domains,
+                    vt_malicious_threshold = excluded.vt_malicious_threshold,
+                    vt_suspicious_threshold = excluded.vt_suspicious_threshold,
+                    mod_embed_delete_after_seconds = excluded.mod_embed_delete_after_seconds
                 """,
                 (
                     guild_id,
@@ -196,6 +276,11 @@ class ModerationDatabase:
                     1 if merged["review_queue_enabled"] else 0,
                     merged["review_confidence_floor"],
                     merged["report_channel_id"],
+                    1 if merged["url_scan_enabled"] else 0,
+                    json.dumps(merged["url_allowlist_domains"]),
+                    merged["vt_malicious_threshold"],
+                    merged["vt_suspicious_threshold"],
+                    merged["mod_embed_delete_after_seconds"],
                 ),
             )
             await db.commit()
@@ -211,13 +296,14 @@ class ModerationDatabase:
         created_at_iso: str,
         *,
         keep_per_channel: int = 200,
-    ) -> None:
+    ) -> str:
+        event_ref = await self.allocate_event_ref(guild_id)
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
                 """
                 INSERT INTO message_history (
-                    guild_id, channel_id, message_id, author_id, author_name, content, created_at_iso
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    guild_id, channel_id, message_id, author_id, author_name, content, created_at_iso, event_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     guild_id,
@@ -227,6 +313,7 @@ class ModerationDatabase:
                     author_name,
                     content[:4000],
                     created_at_iso,
+                    event_ref,
                 ),
             )
             await db.execute(
@@ -245,6 +332,7 @@ class ModerationDatabase:
                 (channel_id, channel_id, keep_per_channel),
             )
             await db.commit()
+        return event_ref
 
     async def fetch_recent_messages(
         self,
@@ -255,7 +343,7 @@ class ModerationDatabase:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """
-                SELECT author_id, author_name, content, created_at_iso, message_id
+                SELECT author_id, author_name, content, created_at_iso, message_id, event_ref
                 FROM message_history
                 WHERE channel_id = ?
                 ORDER BY id DESC
@@ -275,6 +363,7 @@ class ModerationDatabase:
                     content=str(r["content"]),
                     created_at_iso=str(r["created_at_iso"]),
                     message_id=int(r["message_id"]),
+                    event_ref=str(r["event_ref"]) if r.get("event_ref") else None,
                 )
             )
         return out
@@ -348,14 +437,17 @@ class ModerationDatabase:
         channel_id: int | None = None,
         actor_id: int | None = None,
         details: str | None = None,
-    ) -> int:
+        case_ref: Optional[str] = None,
+    ) -> tuple[int, str]:
+        if case_ref is None:
+            case_ref = await self.allocate_case_ref(guild_id)
         ts = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 """
                 INSERT INTO mod_logs (
-                    guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     guild_id,
@@ -366,10 +458,11 @@ class ModerationDatabase:
                     reason[:2000],
                     details[:4000] if details else None,
                     ts,
+                    case_ref,
                 ),
             )
             await db.commit()
-            return int(cur.lastrowid)
+            return int(cur.lastrowid), case_ref
 
     async def fetch_mod_logs(
         self,
@@ -383,7 +476,7 @@ class ModerationDatabase:
             if target_user_id is None:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
                     FROM mod_logs WHERE guild_id = ? ORDER BY id DESC LIMIT ?
                     """,
                     (guild_id, limit),
@@ -391,7 +484,7 @@ class ModerationDatabase:
             else:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
                     FROM mod_logs
                     WHERE guild_id = ? AND target_user_id = ?
                     ORDER BY id DESC LIMIT ?
@@ -413,6 +506,7 @@ class ModerationDatabase:
                     reason=str(r["reason"]),
                     details=str(r["details"]) if r["details"] is not None else None,
                     created_at_iso=str(r["created_at_iso"]),
+                    case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
                 )
             )
         return result
@@ -458,6 +552,7 @@ class ModerationDatabase:
         payload_json: str,
         *,
         jump_url: Optional[str] = None,
+        case_ref: Optional[str] = None,
     ) -> int:
         ts = datetime.now(timezone.utc).isoformat()
         async with aiosqlite.connect(self._db_path) as db:
@@ -465,8 +560,8 @@ class ModerationDatabase:
                 """
                 INSERT INTO review_queue (
                     guild_id, channel_id, message_id, author_id,
-                    proposed_decision, payload_json, status, created_at_iso, jump_url
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                    proposed_decision, payload_json, status, created_at_iso, jump_url, case_ref
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
                     guild_id,
@@ -477,6 +572,7 @@ class ModerationDatabase:
                     payload_json[:12000],
                     ts,
                     jump_url,
+                    case_ref,
                 ),
             )
             await db.commit()
@@ -504,6 +600,7 @@ class ModerationDatabase:
             status=str(r["status"]),
             created_at_iso=str(r["created_at_iso"]),
             jump_url=str(r["jump_url"]) if r["jump_url"] is not None else None,
+            case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
         )
 
     async def update_review_queue_status(self, entry_id: int, status: str) -> None:
@@ -547,7 +644,7 @@ class ModerationDatabase:
                 since = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
                     FROM mod_logs
                     WHERE guild_id = ? AND created_at_iso >= ?
                     ORDER BY id DESC LIMIT ?
@@ -557,7 +654,7 @@ class ModerationDatabase:
             else:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
                     FROM mod_logs WHERE guild_id = ? ORDER BY id DESC LIMIT ?
                     """,
                     (guild_id, limit),
@@ -577,6 +674,7 @@ class ModerationDatabase:
                     reason=str(r["reason"]),
                     details=str(r["details"]) if r["details"] is not None else None,
                     created_at_iso=str(r["created_at_iso"]),
+                    case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
                 )
             )
         return result
@@ -584,6 +682,16 @@ class ModerationDatabase:
 
 async def _migrate_schema(db: aiosqlite.Connection) -> None:
     """Fügt fehlende Spalten (ältere DBs) und neue Tabellen hinzu."""
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS guild_sequences (
+            guild_id INTEGER PRIMARY KEY,
+            case_seq INTEGER NOT NULL DEFAULT 0,
+            event_seq INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+
     cur = await db.execute("PRAGMA table_info(guild_config)")
     cols = {str(r[1]) for r in await cur.fetchall()}
     alters: list[tuple[str, str]] = [
@@ -593,10 +701,30 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         ("review_queue_enabled", "INTEGER NOT NULL DEFAULT 1"),
         ("review_confidence_floor", "INTEGER NOT NULL DEFAULT 50"),
         ("report_channel_id", "INTEGER"),
+        ("url_scan_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("url_allowlist_domains", "TEXT NOT NULL DEFAULT '[]'"),
+        ("vt_malicious_threshold", "INTEGER NOT NULL DEFAULT 1"),
+        ("vt_suspicious_threshold", "INTEGER NOT NULL DEFAULT 3"),
+        ("mod_embed_delete_after_seconds", "INTEGER"),
     ]
     for name, decl in alters:
         if name not in cols:
             await db.execute(f"ALTER TABLE guild_config ADD COLUMN {name} {decl}")
+
+    cur = await db.execute("PRAGMA table_info(message_history)")
+    mh_cols = {str(r[1]) for r in await cur.fetchall()}
+    if "event_ref" not in mh_cols:
+        await db.execute("ALTER TABLE message_history ADD COLUMN event_ref TEXT")
+
+    cur = await db.execute("PRAGMA table_info(mod_logs)")
+    ml_cols = {str(r[1]) for r in await cur.fetchall()}
+    if "case_ref" not in ml_cols:
+        await db.execute("ALTER TABLE mod_logs ADD COLUMN case_ref TEXT")
+
+    cur = await db.execute("PRAGMA table_info(review_queue)")
+    rq_cols = {str(r[1]) for r in await cur.fetchall()}
+    if "case_ref" not in rq_cols:
+        await db.execute("ALTER TABLE review_queue ADD COLUMN case_ref TEXT")
 
 
 def _default_guild_config(guild_id: int) -> dict[str, Any]:
@@ -618,6 +746,11 @@ def _default_guild_config(guild_id: int) -> dict[str, Any]:
         "review_queue_enabled": True,
         "review_confidence_floor": 50,
         "report_channel_id": None,
+        "url_scan_enabled": False,
+        "url_allowlist_domains": default_url_allowlist(),
+        "vt_malicious_threshold": 1,
+        "vt_suspicious_threshold": 3,
+        "mod_embed_delete_after_seconds": None,
     }
 
 
@@ -631,6 +764,14 @@ def _row_to_guild_config(row: dict[str, Any]) -> dict[str, Any]:
     rq_en = bool(r.get("review_queue_enabled", 1))
     rq_floor = int(r.get("review_confidence_floor", 50))
     rcid = r.get("report_channel_id")
+    try:
+        dom_raw = r.get("url_allowlist_domains")
+        if dom_raw and str(dom_raw).strip() not in ("", "[]"):
+            doms = json.loads(str(dom_raw))
+        else:
+            doms = default_url_allowlist()
+    except json.JSONDecodeError:
+        doms = default_url_allowlist()
     return {
         "guild_id": int(r["guild_id"]),
         "server_rules": str(r["server_rules"]),
@@ -649,6 +790,13 @@ def _row_to_guild_config(row: dict[str, Any]) -> dict[str, Any]:
         "review_queue_enabled": rq_en,
         "review_confidence_floor": rq_floor,
         "report_channel_id": int(rcid) if rcid is not None else None,
+        "url_scan_enabled": bool(r.get("url_scan_enabled", 0)),
+        "url_allowlist_domains": doms,
+        "vt_malicious_threshold": int(r.get("vt_malicious_threshold", 1)),
+        "vt_suspicious_threshold": int(r.get("vt_suspicious_threshold", 3)),
+        "mod_embed_delete_after_seconds": int(m)
+        if (m := r.get("mod_embed_delete_after_seconds")) is not None
+        else None,
     }
 
 
@@ -668,7 +816,18 @@ CREATE TABLE IF NOT EXISTS guild_config (
     strike_escalation_json TEXT NOT NULL DEFAULT '',
     review_queue_enabled INTEGER NOT NULL DEFAULT 1,
     review_confidence_floor INTEGER NOT NULL DEFAULT 50,
-    report_channel_id INTEGER
+    report_channel_id INTEGER,
+    url_scan_enabled INTEGER NOT NULL DEFAULT 0,
+    url_allowlist_domains TEXT NOT NULL DEFAULT '[]',
+    vt_malicious_threshold INTEGER NOT NULL DEFAULT 1,
+    vt_suspicious_threshold INTEGER NOT NULL DEFAULT 3,
+    mod_embed_delete_after_seconds INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS guild_sequences (
+    guild_id INTEGER PRIMARY KEY,
+    case_seq INTEGER NOT NULL DEFAULT 0,
+    event_seq INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS message_history (
@@ -679,7 +838,8 @@ CREATE TABLE IF NOT EXISTS message_history (
     author_id INTEGER NOT NULL,
     author_name TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at_iso TEXT NOT NULL
+    created_at_iso TEXT NOT NULL,
+    event_ref TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_msg_channel ON message_history(channel_id);
 
@@ -703,7 +863,8 @@ CREATE TABLE IF NOT EXISTS mod_logs (
     action TEXT NOT NULL,
     reason TEXT NOT NULL,
     details TEXT,
-    created_at_iso TEXT NOT NULL
+    created_at_iso TEXT NOT NULL,
+    case_ref TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mod_guild ON mod_logs(guild_id);
 
@@ -717,7 +878,8 @@ CREATE TABLE IF NOT EXISTS review_queue (
     payload_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at_iso TEXT NOT NULL,
-    jump_url TEXT
+    jump_url TEXT,
+    case_ref TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_review_guild ON review_queue(guild_id);
 

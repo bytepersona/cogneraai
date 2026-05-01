@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import discord
 from cachetools import TTLCache
@@ -16,6 +16,7 @@ from utils.config import Settings
 from utils.database import ModerationDatabase
 from utils.moderation_jobs import ModerationJob
 from utils.rate_limit import SlidingWindowRateLimiter
+from utils.virustotal_client import VirusTotalClient
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ class ModerationBot(commands.Bot):
         self.msg_cache: TTLCache[str, bool] | None = None
         self.moderation_queue: Optional[asyncio.Queue[ModerationJob]] = None
         self.anthropic_breaker: Optional[AsyncCircuitBreaker] = None
+        self.vt_client: VirusTotalClient | None = None
+        self.vt_url_cache: TTLCache[str, Any] | None = None
 
     async def setup_hook(self) -> None:
         """Initialisiert persistente Dienste und lädt Erweiterungen."""
@@ -61,6 +64,9 @@ class ModerationBot(commands.Bot):
             reset_timeout_s=self.settings.anthropic_circuit_reset_seconds,
             name="anthropic",
         )
+        if self.settings.virustotal_api_key:
+            self.vt_client = VirusTotalClient(self.settings.virustotal_api_key)
+            self.vt_url_cache = TTLCache(maxsize=2_000, ttl=300.0)
 
         await self.load_extension("cogs.moderation")
         await self.load_extension("cogs.admin")

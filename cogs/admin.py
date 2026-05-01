@@ -14,6 +14,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from core_bot import ModerationBot
+from utils.discord_embeds import build_user_notice_embed
+from utils.models import ModerationDecision
+from utils.prompts import MODERATOR_AI_SYSTEM_PROMPT, build_user_payload
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +32,30 @@ def _manage_guild_check():
         if not isinstance(interaction.user, discord.Member):
             return False
         return interaction.user.guild_permissions.manage_guild
+
+    return app_commands.check(predicate)
+
+
+def _check_inspect_permissions():
+    """
+    Mindestens eine: Protokoll anzeigen, Mitglieder bannen, Nachrichten verwalten
+    (entspricht „view audit log“ / „ban members“ / „check messages“).
+    """
+
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.guild is None:
+            raise app_commands.NoPrivateMessage()
+        if not isinstance(interaction.user, discord.Member):
+            return False
+        p = interaction.user.guild_permissions
+        if p.administrator:
+            return True
+        if p.view_audit_log or p.ban_members or p.manage_messages:
+            return True
+        raise app_commands.CheckFailure(
+            "Mindestens eine Berechtigung nötig: **Protokoll anzeigen**, **Mitglieder bannen** "
+            "oder **Nachrichten verwalten**."
+        )
 
     return app_commands.check(predicate)
 
@@ -255,6 +282,120 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
+    @mod_config.command(
+        name="url-scan",
+        description="VirusTotal-URL-Prüfung (nur mit VIRUSTOTAL_API_KEY im Bot; pro Domain-Allowlist)",
+    )
+    @app_commands.describe(aktiv="True = nicht allowlistete Links vor der KI prüfen")
+    @_manage_guild_check()
+    async def mod_config_url_scan(self, interaction: discord.Interaction, aktiv: bool) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        if aktiv and getattr(self.bot, "vt_client", None) is None:
+            await interaction.response.send_message(
+                "VirusTotal ist auf diesem Bot nicht konfiguriert (`VIRUSTOTAL_API_KEY`).",
+                ephemeral=True,
+            )
+            return
+        await self.bot.db.upsert_guild_config(interaction.guild.id, url_scan_enabled=aktiv)
+        await interaction.response.send_message(
+            f"URL-Scan (VirusTotal): **{'an' if aktiv else 'aus'}**.",
+            ephemeral=True,
+        )
+
+    @mod_config.command(name="url-allow-add", description="Domain zur URL-Allowlist hinzufügen (z. B. example.com)")
+    @app_commands.describe(domain="Hostname, optional mit führendem Punkt als Suffix: .github.com")
+    @_manage_guild_check()
+    async def mod_config_url_allow_add(
+        self,
+        interaction: discord.Interaction,
+        domain: str,
+    ) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        d = domain.strip().lower()
+        if not d:
+            await interaction.response.send_message("Ungültige Domain.", ephemeral=True)
+            return
+        cfg = await self.bot.db.get_guild_config(interaction.guild.id)
+        doms: list[str] = list(cfg["url_allowlist_domains"])
+        if d not in doms:
+            doms.append(d)
+        await self.bot.db.upsert_guild_config(interaction.guild.id, url_allowlist_domains=doms)
+        await interaction.response.send_message(f"Allowlist: **{d}** ergänzt.", ephemeral=True)
+
+    @mod_config.command(name="url-allow-remove", description="Domain von der URL-Allowlist entfernen")
+    @app_commands.describe(domain="Gleiche Schreibweise wie bei add")
+    @_manage_guild_check()
+    async def mod_config_url_allow_remove(
+        self,
+        interaction: discord.Interaction,
+        domain: str,
+    ) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        d = domain.strip().lower()
+        cfg = await self.bot.db.get_guild_config(interaction.guild.id)
+        doms = [x for x in cfg["url_allowlist_domains"] if x != d]
+        await self.bot.db.upsert_guild_config(interaction.guild.id, url_allowlist_domains=doms)
+        await interaction.response.send_message(f"Allowlist: **{d}** entfernt (falls vorhanden).", ephemeral=True)
+
+    @mod_config.command(name="vt-thresholds", description="VirusTotal-Schwellen (malicious / suspicious Counts)")
+    @app_commands.describe(
+        malicious="Ab dieser Anzahl „malicious“-Engines wird blockiert",
+        suspicious="Ab dieser Anzahl „suspicious“-Engines wird blockiert",
+    )
+    @_manage_guild_check()
+    async def mod_config_vt_thresholds(
+        self,
+        interaction: discord.Interaction,
+        malicious: int = 1,
+        suspicious: int = 3,
+    ) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        malicious = max(1, min(50, malicious))
+        suspicious = max(0, min(50, suspicious))
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id,
+            vt_malicious_threshold=malicious,
+            vt_suspicious_threshold=suspicious,
+        )
+        await interaction.response.send_message(
+            f"VirusTotal-Schwellen: malicious ≥ **{malicious}**, suspicious ≥ **{suspicious}**.",
+            ephemeral=True,
+        )
+
+    @mod_config.command(
+        name="mod-embed-ttl",
+        description="Auto-Löschen von Bot-Mod-Log-/Review-Nachrichten (Sekunden); überschreibt BOT_MESSAGE_DELETE_AFTER_SECONDS",
+    )
+    @app_commands.describe(sekunden="1–600 Sekunden bis zur automatischen Löschung der Bot-Hinweise")
+    @_manage_guild_check()
+    async def mod_config_mod_embed_ttl(self, interaction: discord.Interaction, sekunden: int) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        s = max(1, min(600, sekunden))
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id,
+            mod_embed_delete_after_seconds=s,
+        )
+        await interaction.response.send_message(
+            f"Mod-Embed-TTL: **{s}** Sekunden (Bot-Hinweise im Mod-Log / Review).",
+            ephemeral=True,
+        )
+
+    @mod_config.command(
+        name="mod-embed-ttl-reset",
+        description="Mod-Embed-TTL wieder auf globale BOT_MESSAGE_DELETE_AFTER_SECONDS aus .env setzen",
+    )
+    @_manage_guild_check()
+    async def mod_config_mod_embed_ttl_reset(self, interaction: discord.Interaction) -> None:
+        assert interaction.guild is not None and self.bot.db is not None
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id,
+            mod_embed_delete_after_seconds=None,
+        )
+        await interaction.response.send_message(
+            "Mod-Embed-TTL: wieder **globale** Zeit aus der Bot-Konfiguration (.env).",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="warn", description="Manuelle Verwarnung (DM mit Fallback)")
     @app_commands.describe(mitglied="Zielnutzer", grund="Kurzer Grund")
     @app_commands.checks.has_permissions(moderate_members=True)
@@ -267,11 +408,16 @@ class AdminCog(commands.Cog):
         assert interaction.guild is not None and interaction.user is not None and self.bot.db is not None
         await interaction.response.defer(ephemeral=True)
         text = f"Du hast eine Verwarnung erhalten: {grund}"
+        warn_embed = build_user_notice_embed(text, ModerationDecision.WARN)
         try:
-            await mitglied.send(text)
+            await mitglied.send(embed=warn_embed)
         except discord.Forbidden:
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
-                await interaction.channel.send(f"{mitglied.mention}: {text}", delete_after=120)
+                await interaction.channel.send(
+                    content=mitglied.mention,
+                    embed=warn_embed,
+                    delete_after=120,
+                )
         await self.bot.db.add_warning(
             interaction.guild.id,
             mitglied.id,
@@ -341,8 +487,9 @@ class AdminCog(commands.Cog):
             return
         lines = []
         for e in logs:
+            cref = f" `{e.case_ref}`" if getattr(e, "case_ref", None) else ""
             lines.append(
-                f"`{e.created_at_iso}` **{e.action}** Ziel={e.target_user_id} — {e.reason[:80]}",
+                f"`{e.created_at_iso}`{cref} **{e.action}** Ziel={e.target_user_id} — {e.reason[:80]}",
             )
         text = "\n".join(lines)[:3500]
         await interaction.followup.send(text, ephemeral=True)
@@ -476,6 +623,64 @@ class AdminCog(commands.Cog):
             await interaction.followup.send("Konnte Report nicht posten.", ephemeral=True)
             return
         await interaction.followup.send("Report übermittelt.", ephemeral=True)
+
+    @app_commands.command(
+        name="check",
+        description="Text mit der KI-Moderation prüfen — reines JSON nur für dich (ephemeral).",
+    )
+    @app_commands.describe(text="Beispielnachricht / Text zur Bewertung")
+    @_check_inspect_permissions()
+    async def slash_check(self, interaction: discord.Interaction, text: str) -> None:
+        assert interaction.guild is not None
+        body = (text or "").strip()[:8000]
+        if not body:
+            await interaction.response.send_message("Bitte einen Text angeben.", ephemeral=True)
+            return
+        ai = self.bot.ai
+        db = self.bot.db
+        if ai is None or db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        gcfg = await db.get_guild_config(interaction.guild.id)
+        thr = int(gcfg["confidence_threshold"])
+        system_prompt = MODERATOR_AI_SYSTEM_PROMPT.format(
+            server_rules=gcfg["server_rules"],
+            context_block="(Kein Channel-Kontext — manuelle Einzelprüfung per /check.)",
+        )
+        sample_block = (
+            "Zeit: (Einzelprüfung)\n"
+            "Autor: (n/v)\n"
+            "Kanal: (n/v)\n"
+            "Nachrichten-ID: (n/v)\n"
+            f"Inhalt:\n{body}"
+        )
+        user_payload = build_user_payload(sample_block)
+        try:
+            result = await ai.moderate(
+                system_prompt=system_prompt,
+                user_payload=user_payload,
+                guild_confidence_threshold=thr,
+            )
+        except Exception:
+            logger.exception("/check — Moderations-API fehlgeschlagen")
+            await interaction.followup.send(
+                "Die Moderations-API ist fehlgeschlagen (Details in den Bot-Logs).",
+                ephemeral=True,
+            )
+            return
+
+        out = json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2)
+        if len(out) <= 1900:
+            await interaction.followup.send(out, ephemeral=True)
+        else:
+            buf = io.BytesIO(out.encode("utf-8"))
+            await interaction.followup.send(
+                "Ergebnis als JSON-Datei:",
+                file=discord.File(buf, filename="moderation-check.json"),
+                ephemeral=True,
+            )
 
 
 async def setup(bot: ModerationBot) -> None:

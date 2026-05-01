@@ -41,6 +41,14 @@ class Settings(BaseSettings):
     anthropic_circuit_failure_threshold: int = Field(default=5, ge=1, le=100)
     anthropic_circuit_reset_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)
 
+    # Bot-Mitteilungen (Mod-Log, Review) nach N Sekunden löschen (0 = nie)
+    bot_message_delete_after_seconds: float = Field(default=30.0, ge=0.0, le=600.0)
+
+    # VirusTotal (optional; URL-Prüfung pro Guild zusätzlich aktivierbar)
+    virustotal_api_key: Optional[str] = None
+    virustotal_malicious_threshold: int = Field(default=1, ge=1, le=50)
+    virustotal_suspicious_threshold: int = Field(default=3, ge=0, le=50)
+
     use_oracle: bool = False
     oracle_user: Optional[str] = None
     oracle_password: Optional[str] = None

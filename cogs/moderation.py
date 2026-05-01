@@ -17,10 +17,14 @@ from discord.ext import commands
 
 from core_bot import ModerationBot
 from utils.circuit_breaker import CircuitOpenError
-from utils.models import ClaudeModerationResponse, ModerationDecision
+from utils.discord_embeds import build_mod_log_embed, build_user_notice_embed
+from utils.models import ClaudeModerationResponse, ModerationDecision, Severity
 from utils.moderation_jobs import ModerationJob
 from utils.prompts import MODERATOR_AI_SYSTEM_PROMPT, build_user_payload
 from utils.strike_escalation import cap_decision_by_strikes
+from utils.url_allowlist import url_is_allowlisted
+from utils.url_parse import extract_http_urls
+from utils.virustotal_client import UrlScanVerdict
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +72,7 @@ class ModerationCog(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             logger.debug("Message nicht abrufbar: %s", e)
             return
-        await self._run_ai_pipeline(message)
+        await self._run_ai_pipeline(message, job.event_ref)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -89,10 +93,12 @@ class ModerationCog(commands.Cog):
             logger.error("Bot nicht vollständig initialisiert — Nachricht ignoriert.")
             return
 
-        await self._persist_only(db, message)
+        event_ref = await self._persist_only(db, message)
 
         gcfg = await db.get_guild_config(message.guild.id)
-        if not gcfg["ai_enabled"]:
+        need_ai = bool(gcfg["ai_enabled"])
+        need_url_scan = bool(gcfg.get("url_scan_enabled")) and self.bot.vt_client is not None
+        if not need_ai and not need_url_scan:
             return
 
         if self._is_whitelisted(message, gcfg):
@@ -102,28 +108,38 @@ class ModerationCog(commands.Cog):
             logger.warning("Rate-Limit für User %s — keine API.", message.author.id)
             return
 
-        cache_key = self._cache_key(message)
-        if cache_key in cache:
-            logger.debug("Cache-Treffer — keine erneute API für Hash %s...", cache_key[:12])
+        content_display = (message.content or "").strip()
+        urls_in_msg = extract_http_urls(message.content or "")
+        if not content_display and not message.attachments and not urls_in_msg:
             return
 
-        content_display = (message.content or "").strip()
-        if not content_display and not message.attachments:
+        if need_ai:
+            cache_key = self._cache_key(message)
+            if cache_key in cache:
+                logger.debug("Cache-Treffer — keine erneute API für Hash %s...", cache_key[:12])
+                return
+        elif not urls_in_msg:
             return
 
         job = ModerationJob(
             guild_id=message.guild.id,
             channel_id=message.channel.id,
             message_id=message.id,
+            event_ref=event_ref,
         )
         try:
             queue.put_nowait(job)
         except asyncio.QueueFull:
             logger.error("Moderationsqueue voll — Nachricht %s nicht analysiert.", message.id)
             return
-        cache[cache_key] = True
+        if need_ai:
+            cache[cache_key] = True
 
-    async def _run_ai_pipeline(self, message: discord.Message) -> None:
+    async def _run_ai_pipeline(
+        self,
+        message: discord.Message,
+        event_ref: Optional[str] = None,
+    ) -> None:
         db = self.bot.db
         settings = self.bot.settings
         ai = self.bot.ai
@@ -132,9 +148,53 @@ class ModerationCog(commands.Cog):
             return
 
         gcfg = await db.get_guild_config(message.guild.id)
-        if not gcfg["ai_enabled"]:
-            return
         if self._is_whitelisted(message, gcfg):
+            return
+
+        url_decision = await self._evaluate_urls_vt(message, gcfg)
+        if url_decision is not None:
+            case_ref = await db.allocate_case_ref(message.guild.id)
+            new_strikes = await db.increment_user_strike(message.guild.id, message.author.id)
+            if gcfg.get("strike_escalation_enabled"):
+                effective = cap_decision_by_strikes(
+                    url_decision,
+                    new_strikes,
+                    gcfg.get("strike_escalation_json") or "",
+                )
+            else:
+                effective = url_decision
+            if self._needs_review(url_decision, effective, gcfg):
+                payload = json.dumps(effective.model_dump(mode="json"), ensure_ascii=False)
+                qid = await db.insert_review_queue(
+                    message.guild.id,
+                    message.channel.id,
+                    message.id,
+                    message.author.id,
+                    effective.moderation_decision.value,
+                    payload,
+                    jump_url=message.jump_url,
+                    case_ref=case_ref,
+                )
+                await self._post_review_embed(
+                    message, url_decision, effective, gcfg, qid, case_ref=case_ref, event_ref=event_ref
+                )
+                await db.add_mod_log(
+                    message.guild.id,
+                    message.author.id,
+                    "review_queued",
+                    effective.reason,
+                    channel_id=message.channel.id,
+                    actor_id=None,
+                    details=f"queue_id={qid} | strikes={new_strikes} | url_scan=vt",
+                    case_ref=case_ref,
+                )
+                return
+            await self._execute_decision(
+                message, effective, gcfg, db, case_ref=case_ref, event_ref=event_ref
+            )
+            return
+
+        if not gcfg["ai_enabled"]:
             return
 
         ctx_limit = settings.context_message_count
@@ -167,6 +227,7 @@ class ModerationCog(commands.Cog):
         if decision.moderation_decision == ModerationDecision.ALLOW:
             return
 
+        case_ref = await db.allocate_case_ref(message.guild.id)
         new_strikes = await db.increment_user_strike(message.guild.id, message.author.id)
         if gcfg.get("strike_escalation_enabled"):
             effective = cap_decision_by_strikes(
@@ -187,8 +248,11 @@ class ModerationCog(commands.Cog):
                 effective.moderation_decision.value,
                 payload,
                 jump_url=message.jump_url,
+                case_ref=case_ref,
             )
-            await self._post_review_embed(message, decision, effective, gcfg, qid)
+            await self._post_review_embed(
+                message, decision, effective, gcfg, qid, case_ref=case_ref, event_ref=event_ref
+            )
             await db.add_mod_log(
                 message.guild.id,
                 message.author.id,
@@ -197,10 +261,11 @@ class ModerationCog(commands.Cog):
                 channel_id=message.channel.id,
                 actor_id=None,
                 details=f"queue_id={qid} | strikes={new_strikes}",
+                case_ref=case_ref,
             )
             return
 
-        await self._execute_decision(message, effective, gcfg, db)
+        await self._execute_decision(message, effective, gcfg, db, case_ref=case_ref, event_ref=event_ref)
 
     @staticmethod
     def _needs_review(
@@ -228,6 +293,9 @@ class ModerationCog(commands.Cog):
         effective: ClaudeModerationResponse,
         gcfg: dict[str, Any],
         queue_id: int,
+        *,
+        case_ref: Optional[str] = None,
+        event_ref: Optional[str] = None,
     ) -> None:
         cid = gcfg.get("mod_log_channel_id")
         if not cid:
@@ -247,11 +315,18 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="Vorschlag (nach Strikes)", value=effective.moderation_decision.value, inline=True)
         embed.add_field(name="Confidence", value=str(orig.confidence), inline=True)
         embed.add_field(name="Grund", value=(effective.reason or "")[:900], inline=False)
-        embed.set_footer(text=f"queue_id={queue_id}")
+        if case_ref:
+            embed.add_field(name="Fall-ID", value=f"`{case_ref}`", inline=True)
+        if event_ref:
+            embed.add_field(name="Ereignis-ID", value=f"`{event_ref}`", inline=True)
+        foot = f"ModeratorAI · Review · queue_id={queue_id}"
+        embed.set_footer(text=foot)
+        embed.timestamp = discord.utils.utcnow()
 
         view = ReviewView(self.bot, queue_id)
+        delete_after = self._resolve_embed_delete_after(gcfg)
         try:
-            await ch.send(embed=embed, view=view)
+            await ch.send(embed=embed, view=view, delete_after=delete_after)
         except discord.HTTPException:
             logger.exception("Konnte Review-Embed nicht senden.")
 
@@ -268,9 +343,9 @@ class ModerationCog(commands.Cog):
         gcfg["dry_run"] = False
         await self._execute_decision(message, effective, gcfg, db)
 
-    async def _persist_only(self, db: Any, message: discord.Message) -> None:
+    async def _persist_only(self, db: Any, message: discord.Message) -> str:
         ts = message.created_at.astimezone(timezone.utc).isoformat()
-        await db.insert_message(
+        return await db.insert_message(
             message.guild.id,
             message.channel.id,
             message.id,
@@ -279,6 +354,66 @@ class ModerationCog(commands.Cog):
             message.content or "",
             ts,
         )
+
+    def _resolve_embed_delete_after(self, gcfg: dict[str, Any]) -> Optional[float]:
+        raw = gcfg.get("mod_embed_delete_after_seconds")
+        if raw is not None:
+            if int(raw) <= 0:
+                return None
+            return float(raw)
+        bs = self.bot.settings.bot_message_delete_after_seconds
+        return float(bs) if bs > 0 else None
+
+    async def _get_vt_verdict_cached(self, url: str) -> Optional[UrlScanVerdict]:
+        cache = self.bot.vt_url_cache
+        vt = self.bot.vt_client
+        if vt is None:
+            return None
+        if cache is not None and url in cache:
+            return cache[url]  # type: ignore[return-value]
+        verdict = await vt.get_url_verdict(url)
+        if cache is not None and verdict is not None:
+            cache[url] = verdict
+        return verdict
+
+    async def _evaluate_urls_vt(
+        self,
+        message: discord.Message,
+        gcfg: dict[str, Any],
+    ) -> Optional[ClaudeModerationResponse]:
+        if not gcfg.get("url_scan_enabled"):
+            return None
+        if self.bot.vt_client is None:
+            return None
+        urls = extract_http_urls(message.content or "")
+        if not urls:
+            return None
+        patterns = list(gcfg.get("url_allowlist_domains") or [])
+        mal_thr = int(gcfg.get("vt_malicious_threshold", 1))
+        sus_thr = int(gcfg.get("vt_suspicious_threshold", 3))
+        for url in urls:
+            if url_is_allowlisted(url, patterns):
+                continue
+            verdict = await self._get_vt_verdict_cached(url)
+            if verdict is None:
+                continue
+            if verdict.malicious >= mal_thr or verdict.suspicious >= sus_thr:
+                return ClaudeModerationResponse(
+                    moderation_decision=ModerationDecision.DELETE,
+                    confidence=100,
+                    severity=Severity.HIGH,
+                    reason="Link durch VirusTotal als riskant eingestuft",
+                    explanation=(
+                        f"URL: {url[:900]}\n"
+                        f"VirusTotal: malicious={verdict.malicious}, "
+                        f"suspicious={verdict.suspicious}, harmless={verdict.harmless}"
+                    ),
+                    user_facing_message=(
+                        "Ein Link in deiner Nachricht wurde automatisch als riskant eingestuft."
+                    ),
+                    requires_manual_review=False,
+                )
+        return None
 
     def _is_whitelisted(self, message: discord.Message, gcfg: dict) -> bool:
         uid = message.author.id
@@ -328,8 +463,9 @@ class ModerationCog(commands.Cog):
         lines.append("#### Letzte Channel-Nachrichten (chronologisch, inkl. aktueller Eintrag)")
         for m in recent:
             mark = " **← zu prüfend**" if m.message_id == message.id else ""
+            ev = f" `{m.event_ref}`" if getattr(m, "event_ref", None) else ""
             lines.append(
-                f"- [{m.created_at_iso}] {m.author_name} (ID {m.author_id}): "
+                f"- [{m.created_at_iso}]{ev} {m.author_name} (ID {m.author_id}): "
                 f"{m.content[:500]}{mark}",
             )
         return "\n".join(lines)
@@ -340,22 +476,37 @@ class ModerationCog(commands.Cog):
         d: ClaudeModerationResponse,
         gcfg: dict,
         db,
+        *,
+        case_ref: Optional[str] = None,
+        event_ref: Optional[str] = None,
     ) -> None:
         """Wendet delete / timeout / ban an und protokolliert."""
+        log_details = d.explanation or d.reason
+        jump_url = message.jump_url
+
         if gcfg.get("dry_run"):
-            await db.add_mod_log(
+            _, cr = await db.add_mod_log(
                 message.guild.id,
                 message.author.id,
                 f"dry_run_{d.moderation_decision.value}",
                 d.reason,
                 channel_id=message.channel.id,
                 actor_id=None,
-                details=f"[DRY-RUN] {d.explanation or d.reason}",
+                details=f"[DRY-RUN] {log_details}",
+                case_ref=case_ref,
             )
             await self._maybe_post_mod_log(
                 message.guild,
                 gcfg,
-                f"[DRY-RUN] simuliert: **{d.moderation_decision.value}** — {message.author} — {d.reason}",
+                decision=d.moderation_decision,
+                target_user=message.author,
+                reason=d.reason,
+                detail=log_details,
+                jump_url=jump_url,
+                simulated=True,
+                timeout_minutes=d.timeout_minutes,
+                case_ref=cr,
+                event_ref=event_ref,
             )
             return
 
@@ -364,11 +515,13 @@ class ModerationCog(commands.Cog):
         if not isinstance(member, discord.Member):
             member = guild.get_member(message.author.id) or message.author
 
-        log_details = d.explanation or d.reason
-
         try:
             if d.moderation_decision == ModerationDecision.WARN:
-                await self._send_user_notice(message, d.user_facing_message or d.reason)
+                await self._send_user_notice(
+                    message,
+                    d.user_facing_message or d.reason,
+                    decision=d.moderation_decision,
+                )
                 await db.add_warning(
                     guild.id,
                     message.author.id,
@@ -376,7 +529,7 @@ class ModerationCog(commands.Cog):
                     moderator_id=None,
                     source="ai",
                 )
-                await db.add_mod_log(
+                _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "warn",
@@ -384,11 +537,18 @@ class ModerationCog(commands.Cog):
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
+                    case_ref=case_ref,
                 )
                 await self._maybe_post_mod_log(
                     guild,
                     gcfg,
-                    f"Verwarnung (KI): {message.author} — {d.reason}",
+                    decision=d.moderation_decision,
+                    target_user=message.author,
+                    reason=d.reason,
+                    detail=log_details,
+                    jump_url=jump_url,
+                    case_ref=cr,
+                    event_ref=event_ref,
                 )
 
             elif d.moderation_decision == ModerationDecision.DELETE:
@@ -396,8 +556,9 @@ class ModerationCog(commands.Cog):
                 await self._send_user_notice(
                     message,
                     d.user_facing_message or "Deine Nachricht wurde entfernt.",
+                    decision=d.moderation_decision,
                 )
-                await db.add_mod_log(
+                _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "delete",
@@ -405,11 +566,18 @@ class ModerationCog(commands.Cog):
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
+                    case_ref=case_ref,
                 )
                 await self._maybe_post_mod_log(
                     guild,
                     gcfg,
-                    f"Löschung (KI): {message.author} — {d.reason}",
+                    decision=d.moderation_decision,
+                    target_user=message.author,
+                    reason=d.reason,
+                    detail=log_details,
+                    jump_url=jump_url,
+                    case_ref=cr,
+                    event_ref=event_ref,
                 )
 
             elif d.moderation_decision == ModerationDecision.TIMEOUT:
@@ -423,8 +591,9 @@ class ModerationCog(commands.Cog):
                 await self._send_user_notice(
                     message,
                     d.user_facing_message or f"Du wurdest für {minutes} Minuten stummgeschaltet.",
+                    decision=d.moderation_decision,
                 )
-                await db.add_mod_log(
+                _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "timeout",
@@ -432,11 +601,19 @@ class ModerationCog(commands.Cog):
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=f"{log_details} | Minuten: {minutes}",
+                    case_ref=case_ref,
                 )
                 await self._maybe_post_mod_log(
                     guild,
                     gcfg,
-                    f"Timeout (KI, {minutes}m): {message.author} — {d.reason}",
+                    decision=d.moderation_decision,
+                    target_user=message.author,
+                    reason=d.reason,
+                    detail=log_details,
+                    jump_url=jump_url,
+                    timeout_minutes=minutes,
+                    case_ref=cr,
+                    event_ref=event_ref,
                 )
 
             elif d.moderation_decision == ModerationDecision.BAN:
@@ -451,7 +628,7 @@ class ModerationCog(commands.Cog):
                         discord.Object(id=message.author.id),
                         reason=f"KI-Ban: {d.reason}",
                     )
-                await db.add_mod_log(
+                _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "ban",
@@ -459,11 +636,18 @@ class ModerationCog(commands.Cog):
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
+                    case_ref=case_ref,
                 )
                 await self._maybe_post_mod_log(
                     guild,
                     gcfg,
-                    f"Ban (KI): {message.author} — {d.reason}",
+                    decision=d.moderation_decision,
+                    target_user=message.author,
+                    reason=d.reason,
+                    detail=log_details,
+                    jump_url=jump_url,
+                    case_ref=cr,
+                    event_ref=event_ref,
                 )
 
         except discord.Forbidden:
@@ -477,19 +661,27 @@ class ModerationCog(commands.Cog):
         except (discord.Forbidden, discord.NotFound):
             pass
 
-    async def _send_user_notice(self, message: discord.Message, text: str) -> None:
+    async def _send_user_notice(
+        self,
+        message: discord.Message,
+        text: str,
+        *,
+        decision: ModerationDecision,
+    ) -> None:
         if not text:
             return
+        embed = build_user_notice_embed(text, decision)
         member = message.author
         try:
             if isinstance(member, discord.Member):
-                await member.send(text)
+                await member.send(embed=embed)
             else:
-                await message.author.send(text)
+                await message.author.send(embed=embed)
         except discord.Forbidden:
             try:
                 await message.channel.send(
-                    f"{message.author.mention}: {text}",
+                    content=message.author.mention,
+                    embed=embed,
                     delete_after=120,
                 )
             except discord.HTTPException:
@@ -499,17 +691,40 @@ class ModerationCog(commands.Cog):
         self,
         guild: discord.Guild,
         gcfg: dict,
-        text: str,
+        *,
+        decision: ModerationDecision,
+        target_user: discord.User,
+        reason: str,
+        detail: Optional[str] = None,
+        jump_url: Optional[str] = None,
+        simulated: bool = False,
+        timeout_minutes: Optional[int] = None,
+        case_ref: Optional[str] = None,
+        event_ref: Optional[str] = None,
     ) -> None:
         cid = gcfg.get("mod_log_channel_id")
         if not cid:
             return
         ch = guild.get_channel(int(cid))
-        if isinstance(ch, discord.TextChannel):
-            try:
-                await ch.send(text[:2000])
-            except discord.HTTPException:
-                logger.warning("Mod-Log-Channel nicht beschreibbar.")
+        if not isinstance(ch, discord.TextChannel):
+            return
+        embed = build_mod_log_embed(
+            decision=decision,
+            target_display=str(target_user),
+            target_id=target_user.id,
+            reason=reason,
+            jump_url=jump_url,
+            detail=detail,
+            simulated=simulated,
+            timeout_minutes=timeout_minutes,
+            case_ref=case_ref,
+            event_ref=event_ref,
+        )
+        delete_after = self._resolve_embed_delete_after(gcfg)
+        try:
+            await ch.send(embed=embed, delete_after=delete_after)
+        except discord.HTTPException:
+            logger.warning("Mod-Log-Channel nicht beschreibbar.")
 
 
 class ReviewView(discord.ui.View):
