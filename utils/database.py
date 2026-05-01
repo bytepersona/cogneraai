@@ -53,6 +53,8 @@ class ModLogEntry:
     details: str | None
     created_at_iso: str
     case_ref: Optional[str] = None
+    evaluation_json: Optional[str] = None
+    message_content_snapshot: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -438,16 +440,21 @@ class ModerationDatabase:
         actor_id: int | None = None,
         details: str | None = None,
         case_ref: Optional[str] = None,
+        evaluation_json: Optional[str] = None,
+        message_content_snapshot: Optional[str] = None,
     ) -> tuple[int, str]:
         if case_ref is None:
             case_ref = await self.allocate_case_ref(guild_id)
         ts = datetime.now(timezone.utc).isoformat()
+        ev = evaluation_json[:15_000] if evaluation_json else None
+        snap = message_content_snapshot[:4000] if message_content_snapshot else None
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
                 """
                 INSERT INTO mod_logs (
-                    guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                    created_at_iso, case_ref, evaluation_json, message_content_snapshot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     guild_id,
@@ -459,6 +466,8 @@ class ModerationDatabase:
                     details[:4000] if details else None,
                     ts,
                     case_ref,
+                    ev,
+                    snap,
                 ),
             )
             await db.commit()
@@ -476,7 +485,8 @@ class ModerationDatabase:
             if target_user_id is None:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                           created_at_iso, case_ref, evaluation_json, message_content_snapshot
                     FROM mod_logs WHERE guild_id = ? ORDER BY id DESC LIMIT ?
                     """,
                     (guild_id, limit),
@@ -484,7 +494,8 @@ class ModerationDatabase:
             else:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                           created_at_iso, case_ref, evaluation_json, message_content_snapshot
                     FROM mod_logs
                     WHERE guild_id = ? AND target_user_id = ?
                     ORDER BY id DESC LIMIT ?
@@ -507,6 +518,10 @@ class ModerationDatabase:
                     details=str(r["details"]) if r["details"] is not None else None,
                     created_at_iso=str(r["created_at_iso"]),
                     case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
+                    evaluation_json=str(r["evaluation_json"]) if r.get("evaluation_json") else None,
+                    message_content_snapshot=str(r["message_content_snapshot"])
+                    if r.get("message_content_snapshot")
+                    else None,
                 )
             )
         return result
@@ -644,7 +659,8 @@ class ModerationDatabase:
                 since = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                           created_at_iso, case_ref, evaluation_json, message_content_snapshot
                     FROM mod_logs
                     WHERE guild_id = ? AND created_at_iso >= ?
                     ORDER BY id DESC LIMIT ?
@@ -654,7 +670,8 @@ class ModerationDatabase:
             else:
                 cur = await db.execute(
                     """
-                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details, created_at_iso, case_ref
+                    SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                           created_at_iso, case_ref, evaluation_json, message_content_snapshot
                     FROM mod_logs WHERE guild_id = ? ORDER BY id DESC LIMIT ?
                     """,
                     (guild_id, limit),
@@ -675,9 +692,89 @@ class ModerationDatabase:
                     details=str(r["details"]) if r["details"] is not None else None,
                     created_at_iso=str(r["created_at_iso"]),
                     case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
+                    evaluation_json=str(r["evaluation_json"]) if r.get("evaluation_json") else None,
+                    message_content_snapshot=str(r["message_content_snapshot"])
+                    if r.get("message_content_snapshot")
+                    else None,
                 )
             )
         return result
+
+    async def fetch_mod_log_by_id(self, guild_id: int, log_id: int) -> Optional[ModLogEntry]:
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                       created_at_iso, case_ref, evaluation_json, message_content_snapshot
+                FROM mod_logs WHERE guild_id = ? AND id = ?
+                """,
+                (guild_id, log_id),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        r = dict(row)
+        return ModLogEntry(
+            id=int(r["id"]),
+            guild_id=int(r["guild_id"]),
+            channel_id=int(r["channel_id"]) if r["channel_id"] is not None else None,
+            target_user_id=int(r["target_user_id"]),
+            actor_id=int(r["actor_id"]) if r["actor_id"] is not None else None,
+            action=str(r["action"]),
+            reason=str(r["reason"]),
+            details=str(r["details"]) if r["details"] is not None else None,
+            created_at_iso=str(r["created_at_iso"]),
+            case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
+            evaluation_json=str(r["evaluation_json"]) if r.get("evaluation_json") else None,
+            message_content_snapshot=str(r["message_content_snapshot"])
+            if r.get("message_content_snapshot")
+            else None,
+        )
+
+    async def fetch_cases_with_evaluation(
+        self,
+        guild_id: int,
+        *,
+        limit: int = 10,
+    ) -> list[ModLogEntry]:
+        """Neueste Logs mit gespeicherter KI-/Auswertungs-JSON (für /cases)."""
+        lim = max(1, min(25, limit))
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                       created_at_iso, case_ref, evaluation_json, message_content_snapshot
+                FROM mod_logs
+                WHERE guild_id = ? AND evaluation_json IS NOT NULL AND TRIM(evaluation_json) != ''
+                ORDER BY id DESC LIMIT ?
+                """,
+                (guild_id, lim),
+            )
+            rows = await cur.fetchall()
+        out: list[ModLogEntry] = []
+        for row in rows:
+            r = dict(row)
+            out.append(
+                ModLogEntry(
+                    id=int(r["id"]),
+                    guild_id=int(r["guild_id"]),
+                    channel_id=int(r["channel_id"]) if r["channel_id"] is not None else None,
+                    target_user_id=int(r["target_user_id"]),
+                    actor_id=int(r["actor_id"]) if r["actor_id"] is not None else None,
+                    action=str(r["action"]),
+                    reason=str(r["reason"]),
+                    details=str(r["details"]) if r["details"] is not None else None,
+                    created_at_iso=str(r["created_at_iso"]),
+                    case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
+                    evaluation_json=str(r["evaluation_json"]) if r.get("evaluation_json") else None,
+                    message_content_snapshot=str(r["message_content_snapshot"])
+                    if r.get("message_content_snapshot")
+                    else None,
+                )
+            )
+        return out
 
 
 async def _migrate_schema(db: aiosqlite.Connection) -> None:
@@ -720,6 +817,10 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
     ml_cols = {str(r[1]) for r in await cur.fetchall()}
     if "case_ref" not in ml_cols:
         await db.execute("ALTER TABLE mod_logs ADD COLUMN case_ref TEXT")
+    if "evaluation_json" not in ml_cols:
+        await db.execute("ALTER TABLE mod_logs ADD COLUMN evaluation_json TEXT")
+    if "message_content_snapshot" not in ml_cols:
+        await db.execute("ALTER TABLE mod_logs ADD COLUMN message_content_snapshot TEXT")
 
     cur = await db.execute("PRAGMA table_info(review_queue)")
     rq_cols = {str(r[1]) for r in await cur.fetchall()}
@@ -864,7 +965,9 @@ CREATE TABLE IF NOT EXISTS mod_logs (
     reason TEXT NOT NULL,
     details TEXT,
     created_at_iso TEXT NOT NULL,
-    case_ref TEXT
+    case_ref TEXT,
+    evaluation_json TEXT,
+    message_content_snapshot TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_mod_guild ON mod_logs(guild_id);
 

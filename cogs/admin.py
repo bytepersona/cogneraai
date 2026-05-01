@@ -14,7 +14,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from core_bot import ModerationBot
-from utils.discord_embeds import build_user_notice_embed
+from .case_views import CasesPaginatorView, CheckEvaluationView, entry_embed
+from utils.discord_embeds import build_check_result_embed, build_user_notice_embed
 from utils.models import ModerationDecision
 from utils.prompts import MODERATOR_AI_SYSTEM_PROMPT, build_user_payload
 
@@ -546,6 +547,9 @@ class AdminCog(commands.Cog):
                     "reason": e.reason,
                     "details": e.details,
                     "channel_id": e.channel_id,
+                    "case_ref": e.case_ref,
+                    "evaluation_json": e.evaluation_json,
+                    "message_content_snapshot": e.message_content_snapshot,
                 }
                 for e in logs
             ]
@@ -628,7 +632,7 @@ class AdminCog(commands.Cog):
 
     @app_commands.command(
         name="check",
-        description="Text mit der KI-Moderation prüfen — reines JSON nur für dich (ephemeral).",
+        description="KI-Check: Kurz-Embed; volles JSON per Button See Evaluation (ephemeral).",
     )
     @app_commands.describe(text="Beispielnachricht / Text zur Bewertung")
     @_check_inspect_permissions()
@@ -674,15 +678,55 @@ class AdminCog(commands.Cog):
             return
 
         out = json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2)
-        if len(out) <= 1900:
-            await interaction.followup.send(out, ephemeral=True)
-        else:
-            buf = io.BytesIO(out.encode("utf-8"))
+        ts = discord.utils.utcnow().replace(microsecond=0).isoformat() + "Z"
+        emb = build_check_result_embed(
+            text_preview=body,
+            decision=result.moderation_decision,
+            confidence=result.confidence,
+            severity=getattr(result.severity, "value", str(result.severity)),
+            reason=result.reason,
+            requires_manual_review=result.requires_manual_review,
+        )
+        view = CheckEvaluationView(json_text=out, ts_iso=ts)
+        await interaction.followup.send(embed=emb, view=view, ephemeral=True)
+
+    @app_commands.command(
+        name="cases",
+        description="Letzte Fälle mit gespeicherter KI-Auswertung — Blättern & JSON-Button.",
+    )
+    @app_commands.describe(anzahl="Wie viele Fälle max. (1–15, neueste zuerst)")
+    @_check_inspect_permissions()
+    async def slash_cases(
+        self,
+        interaction: discord.Interaction,
+        anzahl: int = 8,
+    ) -> None:
+        assert interaction.guild is not None
+        db = self.bot.db
+        if db is None:
+            await interaction.response.send_message("Datenbank nicht verfügbar.", ephemeral=True)
+            return
+        n = max(1, min(15, anzahl))
+        await interaction.response.defer(ephemeral=True)
+        entries = await db.fetch_cases_with_evaluation(interaction.guild.id, limit=n)
+        if not entries:
             await interaction.followup.send(
-                "Ergebnis als JSON-Datei:",
-                file=discord.File(buf, filename="moderation-check.json"),
+                "Keine Fälle mit gespeicherter Auswertung. Nach dem Update nur neue Aktionen.",
                 ephemeral=True,
             )
+            return
+        view = CasesPaginatorView(
+            bot=self.bot,
+            guild_id=interaction.guild.id,
+            entries=entries,
+        )
+        emb0 = entry_embed(entries[0])
+        await interaction.followup.send(
+            content=f"**{len(entries)}** Fälle — ◀/▶ wechseln, **See Evaluation** = JSON + Zeitstempel.",
+            embed=emb0,
+            view=view,
+            ephemeral=True,
+        )
 
 
 async def setup(bot: ModerationBot) -> None:

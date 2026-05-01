@@ -29,6 +29,15 @@ from utils.virustotal_client import UrlScanVerdict
 logger = logging.getLogger(__name__)
 
 
+def _moderation_eval_json(d: ClaudeModerationResponse) -> str:
+    """Serielle Auswertung für DB und „See Evaluation“."""
+    return json.dumps(d.model_dump(mode="json"), ensure_ascii=False)
+
+
+def _message_snapshot(message: discord.Message) -> str:
+    return (message.content or "")[:4000]
+
+
 class ModerationCog(commands.Cog):
     """Lauscht `on_message` und steuert die KI-Moderation (Worker-Queue)."""
 
@@ -187,6 +196,8 @@ class ModerationCog(commands.Cog):
                     actor_id=None,
                     details=f"queue_id={qid} | strikes={new_strikes} | url_scan=vt",
                     case_ref=case_ref,
+                    evaluation_json=_moderation_eval_json(effective),
+                    message_content_snapshot=_message_snapshot(message),
                 )
                 return
             await self._execute_decision(
@@ -262,6 +273,8 @@ class ModerationCog(commands.Cog):
                 actor_id=None,
                 details=f"queue_id={qid} | strikes={new_strikes}",
                 case_ref=case_ref,
+                evaluation_json=_moderation_eval_json(effective),
+                message_content_snapshot=_message_snapshot(message),
             )
             return
 
@@ -494,6 +507,8 @@ class ModerationCog(commands.Cog):
                 actor_id=None,
                 details=f"[DRY-RUN] {log_details}",
                 case_ref=case_ref,
+                evaluation_json=_moderation_eval_json(d),
+                message_content_snapshot=_message_snapshot(message),
             )
             await self._maybe_post_mod_log(
                 message.guild,
@@ -538,6 +553,8 @@ class ModerationCog(commands.Cog):
                     actor_id=None,
                     details=log_details,
                     case_ref=case_ref,
+                    evaluation_json=_moderation_eval_json(d),
+                    message_content_snapshot=_message_snapshot(message),
                 )
                 await self._maybe_post_mod_log(
                     guild,
@@ -567,6 +584,8 @@ class ModerationCog(commands.Cog):
                     actor_id=None,
                     details=log_details,
                     case_ref=case_ref,
+                    evaluation_json=_moderation_eval_json(d),
+                    message_content_snapshot=_message_snapshot(message),
                 )
                 await self._maybe_post_mod_log(
                     guild,
@@ -602,6 +621,8 @@ class ModerationCog(commands.Cog):
                     actor_id=None,
                     details=f"{log_details} | Minuten: {minutes}",
                     case_ref=case_ref,
+                    evaluation_json=_moderation_eval_json(d),
+                    message_content_snapshot=_message_snapshot(message),
                 )
                 await self._maybe_post_mod_log(
                     guild,
@@ -637,6 +658,8 @@ class ModerationCog(commands.Cog):
                     actor_id=None,
                     details=log_details,
                     case_ref=case_ref,
+                    evaluation_json=_moderation_eval_json(d),
+                    message_content_snapshot=_message_snapshot(message),
                 )
                 await self._maybe_post_mod_log(
                     guild,

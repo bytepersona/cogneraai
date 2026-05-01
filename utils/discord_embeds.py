@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 import discord
@@ -112,3 +113,70 @@ def build_mod_log_embed(
     embed.set_footer(text=FOOTER_MODLOG)
     embed.timestamp = discord.utils.utcnow()
     return embed
+
+
+def build_check_result_embed(
+    *,
+    text_preview: str,
+    decision: ModerationDecision,
+    confidence: int,
+    severity: str,
+    reason: str,
+    requires_manual_review: bool,
+) -> discord.Embed:
+    """Slash /check: Kurzfassung; volles JSON über Button."""
+    emb = discord.Embed(
+        title="Moderations-Check",
+        description="Einzelprüfung — Button **See Evaluation** zeigt das JSON mit Zeitstempel.",
+        color=color_for_decision(decision),
+    )
+    emb.add_field(name="Entscheidung", value=f"`{decision.value}`", inline=True)
+    emb.add_field(name="Confidence", value=str(confidence), inline=True)
+    emb.add_field(name="Severity", value=severity, inline=True)
+    emb.add_field(name="Review", value="ja" if requires_manual_review else "nein", inline=True)
+    emb.add_field(name="Text (Ausschnitt)", value=(text_preview[:900] if text_preview else "—"), inline=False)
+    emb.add_field(name="Begründung", value=(reason or "—")[:1024], inline=False)
+    emb.set_footer(text="ModeratorAI · /check")
+    emb.timestamp = discord.utils.utcnow()
+    return emb
+
+
+def build_case_browser_embed(
+    *,
+    case_label: str,
+    action: str,
+    target_user_id: int,
+    channel_id: Optional[int],
+    message_snapshot: Optional[str],
+    reason: str,
+    details: Optional[str],
+    log_id: int,
+    created_at_iso: str,
+    evaluation_json: Optional[str],
+) -> discord.Embed:
+    """Slash /cases: ein gespeicherter Fall aus der Datenbank."""
+    color = discord.Color.blurple()
+    if evaluation_json:
+        try:
+            data = json.loads(evaluation_json)
+            md = data.get("moderation_decision")
+            if md:
+                color = color_for_decision(ModerationDecision(md))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    emb = discord.Embed(title=f"Moderationsfall `{case_label}`", color=color)
+    emb.add_field(name="Aktion", value=action, inline=True)
+    emb.add_field(
+        name="Betroffener Nutzer",
+        value=f"<@{target_user_id}> (`{target_user_id}`)",
+        inline=True,
+    )
+    if channel_id:
+        emb.add_field(name="Kanal", value=f"<#{channel_id}>", inline=True)
+    snap = (message_snapshot or "").strip() or "—"
+    emb.add_field(name="Nachricht (Snapshot)", value=snap[:1024], inline=False)
+    emb.add_field(name="Grund", value=(reason or "—")[:1024], inline=False)
+    if details:
+        emb.add_field(name="Details / Log", value=details[:1024], inline=False)
+    emb.set_footer(text=f"log_id={log_id} · {created_at_iso}")
+    return emb
