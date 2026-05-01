@@ -364,7 +364,9 @@ class AdminCog(commands.Cog):
 
     @mod_config.command(
         name="mod-embed-ttl",
-        description="Auto-Löschen von Bot-Mod-Log-/Review-Nachrichten (Sekunden); überschreibt BOT_MESSAGE_DELETE_AFTER_SECONDS",
+        description=(
+            "Auto-Löschen von Bot-Hinweisen (Mod-Log/Review) in Sekunden; überschreibt .env-Standard."
+        ),
     )
     @app_commands.describe(sekunden="1–600 Sekunden bis zur automatischen Löschung der Bot-Hinweise")
     @_manage_guild_check()
