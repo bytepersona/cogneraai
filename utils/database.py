@@ -732,6 +732,40 @@ class ModerationDatabase:
             else None,
         )
 
+    async def fetch_mod_log_by_case_ref(self, guild_id: int, case_ref: str) -> Optional[ModLogEntry]:
+        """Gibt den neuesten Log-Eintrag mit der angegebenen case_ref zurück."""
+        async with aiosqlite.connect(self._db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT id, guild_id, channel_id, target_user_id, actor_id, action, reason, details,
+                       created_at_iso, case_ref, evaluation_json, message_content_snapshot
+                FROM mod_logs WHERE guild_id = ? AND case_ref = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (guild_id, case_ref),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        r = dict(row)
+        return ModLogEntry(
+            id=int(r["id"]),
+            guild_id=int(r["guild_id"]),
+            channel_id=int(r["channel_id"]) if r["channel_id"] is not None else None,
+            target_user_id=int(r["target_user_id"]),
+            actor_id=int(r["actor_id"]) if r["actor_id"] is not None else None,
+            action=str(r["action"]),
+            reason=str(r["reason"]),
+            details=str(r["details"]) if r["details"] is not None else None,
+            created_at_iso=str(r["created_at_iso"]),
+            case_ref=str(r["case_ref"]) if r.get("case_ref") else None,
+            evaluation_json=str(r["evaluation_json"]) if r.get("evaluation_json") else None,
+            message_content_snapshot=str(r["message_content_snapshot"])
+            if r.get("message_content_snapshot")
+            else None,
+        )
+
     async def fetch_cases_with_evaluation(
         self,
         guild_id: int,

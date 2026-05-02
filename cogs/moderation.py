@@ -319,8 +319,9 @@ class ModerationCog(commands.Cog):
         if not isinstance(ch, discord.TextChannel):
             return
 
+        title = f"Moderation: Manuelle Freigabe{f' · `{case_ref}`' if case_ref else ''}"
         embed = discord.Embed(
-            title="Moderation: Manuelle Freigabe",
+            title=title,
             description=f"[Zur Nachricht]({message.jump_url})",
             color=discord.Color.orange(),
         )
@@ -347,6 +348,9 @@ class ModerationCog(commands.Cog):
         self,
         message: discord.Message,
         effective: ClaudeModerationResponse,
+        *,
+        case_ref: Optional[str] = None,
+        event_ref: Optional[str] = None,
     ) -> None:
         """Manuelle Review-Freigabe: setzt um (Dry-Run wird umgangen)."""
         db = self.bot.db
@@ -354,7 +358,9 @@ class ModerationCog(commands.Cog):
             return
         gcfg = dict(await db.get_guild_config(message.guild.id))
         gcfg["dry_run"] = False
-        await self._execute_decision(message, effective, gcfg, db)
+        await self._execute_decision(
+            message, effective, gcfg, db, case_ref=case_ref, event_ref=event_ref
+        )
 
     async def _persist_only(self, db: Any, message: discord.Message) -> str:
         ts = message.created_at.astimezone(timezone.utc).isoformat()
@@ -840,7 +846,9 @@ class ReviewView(discord.ui.View):
         else:
             eff = base
 
-        await mod_cog.execute_decision_for_review(message, eff)
+        await mod_cog.execute_decision_for_review(
+            message, eff, case_ref=entry.case_ref
+        )
         await db.update_review_queue_status(self.queue_id, "resolved_applied")
         await interaction.followup.send("Aktion ausgeführt.", ephemeral=True)
 

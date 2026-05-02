@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
-from typing import Optional
 from collections import defaultdict
+from typing import Optional
+
+
 class SlidingWindowRateLimiter:
     """Erlaubt höchstens `max_calls` Aufrufe pro Nutzer innerhalb von `window_seconds`."""
 
