@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import discord
 from cachetools import TTLCache
+from discord import app_commands
 from discord.ext import commands
 
 from utils.anthropic_moderation import AnthropicModerationClient
@@ -46,6 +47,7 @@ class ModerationBot(commands.Bot):
         self.anthropic_breaker: Optional[AsyncCircuitBreaker] = None
         self.vt_client: VirusTotalClient | None = None
         self.vt_url_cache: TTLCache[str, Any] | None = None
+        self.report_rate_cache: TTLCache[int, int] = TTLCache(maxsize=10_000, ttl=3600.0)
 
     async def setup_hook(self) -> None:
         """Initialisiert persistente Dienste und lädt Erweiterungen."""
@@ -68,8 +70,11 @@ class ModerationBot(commands.Bot):
             self.vt_client = VirusTotalClient(self.settings.virustotal_api_key)
             self.vt_url_cache = TTLCache(maxsize=2_000, ttl=300.0)
 
-        await self.load_extension("cogs.moderation")
-        await self.load_extension("cogs.admin")
+        for ext in ("cogs.moderation", "cogs.admin"):
+            try:
+                await self.load_extension(ext)
+            except Exception:
+                logger.exception("Cog '%s' konnte nicht geladen werden — Bot läuft weiter.", ext)
 
         guild_id = self.settings.discord_guild_id
         try:
@@ -85,3 +90,40 @@ class ModerationBot(commands.Bot):
                 logger.info("Slash-Commands global synchronisiert: %d Befehle", len(synced))
         except Exception:
             logger.exception("Slash-Command-Sync fehlgeschlagen")
+
+        self.tree.on_error = self._on_tree_error
+
+    async def _on_tree_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """Fängt unbehandelte App-Command-Fehler ab und sendet eine lesbare Antwort."""
+        if isinstance(error, app_commands.CheckFailure):
+            msg = str(error) or "Du hast keine Berechtigung für diesen Befehl."
+        elif isinstance(error, app_commands.CommandNotFound):
+            msg = "Befehl nicht gefunden."
+        elif isinstance(error, app_commands.MissingPermissions):
+            msg = f"Fehlende Rechte: {', '.join(error.missing_permissions)}."
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            msg = f"Dem Bot fehlen Rechte: {', '.join(error.missing_permissions)}."
+        elif isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"Cooldown aktiv — bitte {error.retry_after:.0f}s warten."
+        else:
+            logger.exception("Unbehandelter App-Command-Fehler", exc_info=error)
+            msg = "Ein unerwarteter Fehler ist aufgetreten. Details wurden geloggt."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    async def close(self) -> None:
+        if self.vt_client is not None:
+            try:
+                await self.vt_client.aclose()
+            except Exception:
+                logger.warning("Fehler beim Schließen des VirusTotal-Clients.")
+        await super().close()

@@ -46,6 +46,14 @@ class VirusTotalClient:
     ) -> None:
         self._headers = {"x-apikey": api_key}
         self._timeout = timeout_s
+        self._client: httpx.AsyncClient = httpx.AsyncClient(
+            headers=self._headers,
+            timeout=self._timeout,
+        )
+
+    async def aclose(self) -> None:
+        """Schließt die persistente HTTP-Session."""
+        await self._client.aclose()
 
     def _url_id(self, url: str) -> str:
         return base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii").rstrip("=")
@@ -53,29 +61,30 @@ class VirusTotalClient:
     async def fetch_url_report(self, url: str) -> Optional[dict[str, Any]]:
         """GET /urls/{id} — None wenn nicht vorhanden."""
         uid = self._url_id(url)
-        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
-            r = await client.get(f"{VT_API}/urls/{uid}")
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            return r.json()
+        try:
+            r = await self._client.get(f"{VT_API}/urls/{uid}")
+        except httpx.HTTPError as exc:
+            logger.warning("VirusTotal fetch_url_report Netzwerkfehler: %s", exc)
+            return None
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
 
     async def submit_url_scan(self, url: str) -> str:
         """POST /urls — liefert analysis_id."""
-        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
-            r = await client.post(
-                f"{VT_API}/urls",
-                data={"url": url},
-            )
-            r.raise_for_status()
-            data = r.json()
-            return str(data.get("data", {}).get("id", ""))
+        r = await self._client.post(
+            f"{VT_API}/urls",
+            data={"url": url},
+        )
+        r.raise_for_status()
+        data = r.json()
+        return str(data.get("data", {}).get("id", ""))
 
     async def get_analysis(self, analysis_id: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=self._timeout, headers=self._headers) as client:
-            r = await client.get(f"{VT_API}/analyses/{analysis_id}")
-            r.raise_for_status()
-            return r.json()
+        r = await self._client.get(f"{VT_API}/analyses/{analysis_id}")
+        r.raise_for_status()
+        return r.json()
 
     async def get_url_verdict(
         self,
@@ -87,7 +96,12 @@ class VirusTotalClient:
         """
         Liefert Statistiken zu einer URL; reicht ggf. Scan ein und pollt die Analyse.
         """
-        data = await self.fetch_url_report(url)
+        try:
+            data = await self.fetch_url_report(url)
+        except httpx.HTTPError as exc:
+            logger.warning("VirusTotal get_url_verdict Fehler für %s: %s", url[:80], exc)
+            return None
+
         if data is None:
             try:
                 aid = await self.submit_url_scan(url)

@@ -11,6 +11,9 @@ import asyncio
 import logging
 import sys
 
+import discord
+from pydantic import ValidationError
+
 from core_bot import ModerationBot
 from utils.config import load_settings
 
@@ -37,6 +40,19 @@ def main() -> None:
         asyncio.run(_run())
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Beendet durch Benutzer.")
+    except ValidationError as exc:
+        print(
+            "Konfigurationsfehler — bitte .env prüfen:\n"
+            + "\n".join(f"  {e['loc']}: {e['msg']}" for e in exc.errors()),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except discord.LoginFailure:
+        print(
+            "Ungültiger Discord-Token (DISCORD_TOKEN). Bot konnte sich nicht anmelden.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
