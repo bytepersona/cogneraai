@@ -46,6 +46,13 @@ class ClaudeModerationResponse(BaseModel):
     requires_manual_review: bool = Field(False, alias="requires_manual_review")
     violated_rule_ids: list[str] = Field(default_factory=list, alias="violated_rule_ids")
 
+    @field_validator("user_facing_message", "reason", "explanation", "schema_version", mode="before")
+    @classmethod
+    def _null_str_to_empty(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)
+
     @field_validator("violated_rule_ids", mode="before")
     @classmethod
     def _normalize_violated_rule_ids(cls, v: Any) -> list[str]:
