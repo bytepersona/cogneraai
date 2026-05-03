@@ -101,7 +101,6 @@ class ModerationCog(commands.Cog):
             return
 
         db = self.bot.db
-        settings = self.bot.settings
         rate = self.bot.rate_limiter
         cache: TTLCache[str, bool] = self.bot.msg_cache
         queue = self.bot.moderation_queue
@@ -272,14 +271,14 @@ class ModerationCog(commands.Cog):
             await self._post_review_embed(
                 message, decision, effective, gcfg, qid, case_ref=case_ref, event_ref=event_ref
             )
-                await db.add_mod_log(
-                    message.guild.id,
-                    message.author.id,
-                    "review_queued",
-                    (effective.reason or "") + _rule_ids_footer(effective),
-                    channel_id=message.channel.id,
-                    actor_id=None,
-                    details=f"queue_id={qid} | strikes={new_strikes}",
+            await db.add_mod_log(
+                message.guild.id,
+                message.author.id,
+                "review_queued",
+                (effective.reason or "") + _rule_ids_footer(effective),
+                channel_id=message.channel.id,
+                actor_id=None,
+                details=f"queue_id={qid} | strikes={new_strikes}",
                 case_ref=case_ref,
                 evaluation_json=_moderation_eval_json(effective),
                 message_content_snapshot=_message_snapshot(message),

@@ -461,13 +461,11 @@ class AdminCog(commands.Cog):
 
         modlog_ch = cfg.get("mod_log_channel_id")
         report_ch = cfg.get("report_channel_id")
-        review_ch = cfg.get("review_channel_id")
         emb.add_field(name="KI-Moderation", value=yn(cfg.get("ai_enabled", True)), inline=True)
         emb.add_field(name="Dry-Run", value=yn(cfg.get("dry_run", False)), inline=True)
         emb.add_field(name="Confidence-Schwelle", value=str(cfg.get("confidence_threshold", 60)), inline=True)
         emb.add_field(name="Mod-Log-Kanal", value=f"<#{modlog_ch}>" if modlog_ch else "–", inline=True)
         emb.add_field(name="Report-Kanal", value=f"<#{report_ch}>" if report_ch else "–", inline=True)
-        emb.add_field(name="Review-Kanal", value=f"<#{review_ch}>" if review_ch else "–", inline=True)
 
         embed_ttl = cfg.get("mod_embed_delete_after_seconds")
         global_ttl = self.bot.settings.bot_message_delete_after_seconds
@@ -557,7 +555,7 @@ class AdminCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         cfg = await self.bot.db.get_guild_config(interaction.guild.id)
-        enabled = yn_local = cfg.get("strike_escalation_enabled", True)
+        enabled = cfg.get("strike_escalation_enabled", True)
         try:
             esc = json.loads(cfg.get("strike_escalation_json") or "{}")
         except json.JSONDecodeError:
