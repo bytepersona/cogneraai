@@ -589,15 +589,16 @@ class AdminCog(commands.Cog):
             return
         await interaction.response.defer(ephemeral=True)
         text = f"Du hast eine Verwarnung erhalten: {grund}"
-        warn_embed = build_user_notice_embed(text, ModerationDecision.WARN)
+        warn_embed, warn_icon = build_user_notice_embed(text, ModerationDecision.WARN)
         try:
-            await mitglied.send(embed=warn_embed)
+            await mitglied.send(embed=warn_embed, files=[warn_icon] if warn_icon else [])
         except discord.Forbidden:
             if interaction.channel and isinstance(interaction.channel, discord.TextChannel):
                 try:
                     await interaction.channel.send(
                         content=mitglied.mention,
                         embed=warn_embed,
+                        files=[warn_icon] if warn_icon else [],
                         delete_after=120,
                     )
                 except discord.HTTPException:

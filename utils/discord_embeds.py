@@ -8,6 +8,7 @@ from typing import Optional
 import discord
 
 from utils.default_server_rules import format_rule_ids_line, format_rule_ids_with_labels, normalize_violated_rule_ids
+from utils.embed_icons import attach_thumbnail, icon_for_decision
 from utils.models import ModerationDecision
 
 FOOTER_USER = "ModeratorAI · Automatische Moderation"
@@ -53,8 +54,12 @@ def build_user_notice_embed(
     decision: ModerationDecision,
     *,
     violated_rule_ids: Optional[list[str]] = None,
-) -> discord.Embed:
-    """Embed für DM oder öffentlichen Fallback bei Moderationshinweisen."""
+) -> tuple[discord.Embed, Optional["discord.File"]]:
+    """Embed für DM oder öffentlichen Fallback bei Moderationshinweisen.
+
+    Gibt (embed, file) zurück. ``file`` ist None wenn kein Icon gefunden wird;
+    ansonsten muss es zusammen mit dem Embed gesendet werden.
+    """
     body = (text or "").strip()
     ids = normalize_violated_rule_ids(violated_rule_ids or [])
     if ids:
@@ -67,8 +72,9 @@ def build_user_notice_embed(
         description=body if body else "—",
         color=color_for_decision(decision),
     )
+    icon_file = attach_thumbnail(embed, icon_for_decision(decision.value))
     embed.set_footer(text=FOOTER_USER)
-    return embed
+    return embed, icon_file
 
 
 def build_mod_log_embed(
