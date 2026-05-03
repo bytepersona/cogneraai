@@ -528,18 +528,56 @@ class ModerationCog(commands.Cog):
         warnings_block: str,
         message: discord.Message,
     ) -> str:
+        author_id = message.author.id
+        author_tag = f"{message.author} (ID {author_id})"
+        now_utc = message.created_at.astimezone(timezone.utc)
+
         lines: list[str] = []
-        lines.append("#### Verwarnungen (Nutzer)")
+        lines.append(
+            f"#### Verwarnungen für **{author_tag}** (nur dieser Nutzer — nicht andere)"
+        )
         lines.append(warnings_block)
         lines.append("")
-        lines.append("#### Letzte Channel-Nachrichten (chronologisch, inkl. aktueller Eintrag)")
+        lines.append(
+            "#### Letzte Channel-Nachrichten (chronologisch; "
+            f"Nachrichten von **{author_tag}** sind mit [DIESER NUTZER] markiert)"
+        )
         for m in recent:
-            mark = " **← zu prüfend**" if m.message_id == message.id else ""
+            is_author = m.author_id == author_id
+            is_target = m.message_id == message.id
+
+            author_mark = " **[DIESER NUTZER]**" if is_author and not is_target else ""
+            target_mark = " **← ZU PRÜFEN**" if is_target else ""
             ev = f" `{m.event_ref}`" if getattr(m, "event_ref", None) else ""
+
+            # Zeitdifferenz berechnen damit Claude alte Nachrichten einordnen kann
+            try:
+                from datetime import datetime
+                msg_dt = datetime.fromisoformat(m.created_at_iso)
+                if msg_dt.tzinfo is None:
+                    from datetime import timezone as _tz
+                    msg_dt = msg_dt.replace(tzinfo=_tz.utc)
+                age_h = (now_utc - msg_dt).total_seconds() / 3600
+                if age_h > 48:
+                    age_str = f" [vor {age_h / 24:.0f}d]"
+                elif age_h > 1:
+                    age_str = f" [vor {age_h:.0f}h]"
+                else:
+                    age_str = ""
+            except Exception:
+                age_str = ""
+
             lines.append(
-                f"- [{m.created_at_iso}]{ev} {m.author_name} (ID {m.author_id}): "
-                f"{m.content[:500]}{mark}",
+                f"- [{m.created_at_iso}]{age_str}{ev} "
+                f"{m.author_name} (ID {m.author_id}){author_mark}{target_mark}: "
+                f"{m.content[:500]}",
             )
+        lines.append("")
+        lines.append(
+            f"**Wichtig:** Beziehe alle Verwarnungen und vergangenen Nachrichten "
+            f"ausschließlich auf **{author_tag}**. "
+            "Nachrichten anderer Nutzer im Kanal dienen nur als Gesprächskontext."
+        )
         return "\n".join(lines)
 
     async def _execute_decision(
