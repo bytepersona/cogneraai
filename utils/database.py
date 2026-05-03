@@ -568,6 +568,64 @@ class ModerationDatabase:
             await db.commit()
         return int(row[0]) if row else 1
 
+    async def set_user_heat(
+        self,
+        guild_id: int,
+        user_id: int,
+        modifier: int,
+        *,
+        expires_at_iso: Optional[str] = None,
+        set_by_id: Optional[int] = None,
+        reason: str = "",
+    ) -> None:
+        """Setzt den Heat-Modifier für einen Nutzer (+N = stärker beobachten, -N = Visier entfernen)."""
+        ts = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_heat (guild_id, user_id, heat_modifier, expires_at_iso, set_by_id, reason, updated_at_iso)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    heat_modifier = excluded.heat_modifier,
+                    expires_at_iso = excluded.expires_at_iso,
+                    set_by_id = excluded.set_by_id,
+                    reason = excluded.reason,
+                    updated_at_iso = excluded.updated_at_iso
+                """,
+                (guild_id, user_id, modifier, expires_at_iso, set_by_id, reason[:500], ts),
+            )
+            await db.commit()
+
+    async def get_user_heat_modifier(self, guild_id: int, user_id: int) -> int:
+        """Gibt den aktiven Heat-Modifier zurück (0 wenn abgelaufen oder nicht gesetzt)."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT heat_modifier, expires_at_iso FROM user_heat
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return 0
+        modifier, expires = int(row[0]), row[1]
+        if expires is not None and str(expires) < now_iso:
+            return 0
+        return modifier
+
+    async def clear_expired_heat(self, guild_id: int) -> int:
+        """Entfernt abgelaufene Heat-Einträge; gibt Anzahl entfernter Zeilen zurück."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM user_heat WHERE guild_id = ? AND expires_at_iso IS NOT NULL AND expires_at_iso < ?",
+                (guild_id, now_iso),
+            )
+            await db.commit()
+            return cur.rowcount or 0
+
     async def get_user_strikes(self, guild_id: int, user_id: int) -> int:
         async with aiosqlite.connect(self._db_path) as db:
             cur = await db.execute(
@@ -884,6 +942,21 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
     if "case_ref" not in rq_cols:
         await db.execute("ALTER TABLE review_queue ADD COLUMN case_ref TEXT")
 
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_heat (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            heat_modifier INTEGER NOT NULL DEFAULT 0,
+            expires_at_iso TEXT,
+            set_by_id INTEGER,
+            reason TEXT,
+            updated_at_iso TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
+
     _old_rules_placeholder = (
         "(Noch keine Regeln gesetzt — nutze /mod-config um Verhaltensregeln zu hinterlegen.)"
     )
@@ -1065,6 +1138,17 @@ CREATE TABLE IF NOT EXISTS user_strikes (
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     strikes INTEGER NOT NULL DEFAULT 0,
+    updated_at_iso TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_heat (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    heat_modifier INTEGER NOT NULL DEFAULT 0,
+    expires_at_iso TEXT,
+    set_by_id INTEGER,
+    reason TEXT,
     updated_at_iso TEXT NOT NULL,
     PRIMARY KEY (guild_id, user_id)
 );

@@ -54,6 +54,7 @@ def build_user_notice_embed(
     decision: ModerationDecision,
     *,
     violated_rule_ids: Optional[list[str]] = None,
+    message_content: Optional[str] = None,
 ) -> tuple[discord.Embed, Optional["discord.File"]]:
     """Embed für DM oder öffentlichen Fallback bei Moderationshinweisen.
 
@@ -72,6 +73,13 @@ def build_user_notice_embed(
         description=body if body else "—",
         color=color_for_decision(decision),
     )
+    if message_content:
+        preview = message_content.strip()[:900]
+        embed.add_field(
+            name="Betroffene Nachricht",
+            value=f"```\n{preview}\n```",
+            inline=False,
+        )
     icon_file = attach_thumbnail(embed, icon_for_decision(decision.value))
     embed.set_footer(text=FOOTER_USER)
     return embed, icon_file

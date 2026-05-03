@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import discord
@@ -20,6 +21,28 @@ from utils.models import ModerationDecision
 from utils.prompts import MODERATOR_AI_SYSTEM_PROMPT, build_user_payload
 
 logger = logging.getLogger(__name__)
+
+_DURATION_RE = re.compile(r"^(\d+)\s*(m|min|h|hr|d|day|days|w|wk|week|weeks)$", re.IGNORECASE)
+_DURATION_MAP = {
+    "m": 60, "min": 60,
+    "h": 3600, "hr": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "wk": 604800, "week": 604800, "weeks": 604800,
+}
+
+
+def _parse_duration(s: str) -> Optional[timedelta]:
+    """Parst '1h', '2d', '30m', '1w' usw. und gibt ein timedelta zurück oder None."""
+    m = _DURATION_RE.match(s.strip())
+    if not m:
+        return None
+    amount = int(m.group(1))
+    unit = m.group(2).lower()
+    seconds = _DURATION_MAP.get(unit)
+    if seconds is None:
+        return None
+    return timedelta(seconds=amount * seconds)
+
 
 DISCORD_MESSAGE_URL = re.compile(
     r"https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)",
@@ -1233,6 +1256,115 @@ class AdminCog(commands.Cog):
             view=view,
             ephemeral=True,
         )
+
+
+    @app_commands.command(
+        name="add-heat",
+        description="Nutzer stärker beobachten: senkt Confidence-Schwelle und aktiviert Recheck.",
+    )
+    @app_commands.describe(
+        mitglied="Zu beobachtender Nutzer",
+        dauer="Dauer z. B. 1h, 2d, 30m, 1w (leer = permanent bis /remove-heat)",
+        grund="Optionale interne Begründung",
+    )
+    @_manage_guild_check()
+    async def slash_add_heat(
+        self,
+        interaction: discord.Interaction,
+        mitglied: discord.Member,
+        dauer: Optional[str] = None,
+        grund: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None or self.bot.db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+
+        expires_iso: Optional[str] = None
+        duration_display = "permanent"
+        if dauer:
+            td = _parse_duration(dauer)
+            if td is None:
+                await interaction.response.send_message(
+                    "Ungültige Dauer. Beispiele: `30m`, `2h`, `1d`, `1w`.", ephemeral=True
+                )
+                return
+            expires_dt = datetime.now(timezone.utc) + td
+            expires_iso = expires_dt.isoformat()
+            duration_display = discord.utils.format_dt(expires_dt, "R")
+
+        await self.bot.db.set_user_heat(
+            interaction.guild.id,
+            mitglied.id,
+            modifier=15,
+            expires_at_iso=expires_iso,
+            set_by_id=interaction.user.id,
+            reason=grund or "",
+        )
+        emb = discord.Embed(
+            title="🔥 Heat hinzugefügt",
+            color=discord.Color.orange(),
+        )
+        emb.add_field(name="Nutzer", value=f"{mitglied} (`{mitglied.id}`)", inline=True)
+        emb.add_field(name="Läuft ab", value=duration_display, inline=True)
+        if grund:
+            emb.add_field(name="Grund", value=grund[:512], inline=False)
+        emb.set_footer(text=f"Gesetzt von {interaction.user}")
+        emb.timestamp = discord.utils.utcnow()
+        await interaction.response.send_message(embed=emb, ephemeral=True)
+
+    @app_commands.command(
+        name="remove-heat",
+        description="Nutzer vom Visier entfernen: erhöht Confidence-Schwelle temporär.",
+    )
+    @app_commands.describe(
+        mitglied="Betroffener Nutzer",
+        dauer="Dauer z. B. 1h, 2d, 30m, 1w (leer = permanent bis nächster /add-heat)",
+        grund="Optionale interne Begründung",
+    )
+    @_manage_guild_check()
+    async def slash_remove_heat(
+        self,
+        interaction: discord.Interaction,
+        mitglied: discord.Member,
+        dauer: Optional[str] = None,
+        grund: Optional[str] = None,
+    ) -> None:
+        if interaction.guild is None or self.bot.db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+
+        expires_iso: Optional[str] = None
+        duration_display = "permanent"
+        if dauer:
+            td = _parse_duration(dauer)
+            if td is None:
+                await interaction.response.send_message(
+                    "Ungültige Dauer. Beispiele: `30m`, `2h`, `1d`, `1w`.", ephemeral=True
+                )
+                return
+            expires_dt = datetime.now(timezone.utc) + td
+            expires_iso = expires_dt.isoformat()
+            duration_display = discord.utils.format_dt(expires_dt, "R")
+
+        await self.bot.db.set_user_heat(
+            interaction.guild.id,
+            mitglied.id,
+            modifier=-20,
+            expires_at_iso=expires_iso,
+            set_by_id=interaction.user.id,
+            reason=grund or "",
+        )
+        emb = discord.Embed(
+            title="❄️ Heat entfernt",
+            color=discord.Color.blue(),
+        )
+        emb.add_field(name="Nutzer", value=f"{mitglied} (`{mitglied.id}`)", inline=True)
+        emb.add_field(name="Läuft ab", value=duration_display, inline=True)
+        if grund:
+            emb.add_field(name="Grund", value=grund[:512], inline=False)
+        emb.set_footer(text=f"Gesetzt von {interaction.user}")
+        emb.timestamp = discord.utils.utcnow()
+        await interaction.response.send_message(embed=emb, ephemeral=True)
 
 
 async def setup(bot: ModerationBot) -> None:

@@ -215,10 +215,19 @@ class ModerationCog(commands.Cog):
         if not gcfg["ai_enabled"]:
             return
 
+        # Heat-Modifier: +N = strenger beobachten (Schwelle senken), -N = lockerer (Schwelle heben)
+        heat_mod = await db.get_user_heat_modifier(message.guild.id, message.author.id)
+        base_thr = int(gcfg["confidence_threshold"])
+        thr = max(0, min(99, base_thr - heat_mod))
+        if heat_mod != 0:
+            logger.debug(
+                "Heat-Modifier %+d für User %s → Schwelle %d→%d",
+                heat_mod, message.author.id, base_thr, thr,
+            )
+
         ctx_limit = settings.context_message_count
         recent = await db.fetch_recent_messages(message.channel.id, ctx_limit)
         warnings_block = await db.fetch_recent_warnings_text(message.guild.id, message.author.id)
-        thr = int(gcfg["confidence_threshold"])
 
         system_prompt = MODERATOR_AI_SYSTEM_PROMPT.format(
             server_rules=gcfg["server_rules"],
@@ -247,10 +256,11 @@ class ModerationCog(commands.Cog):
 
         # Kontextneuprüfung: bei warn/delete mit niedriger Confidence könnten
         # Witze oder Ironie fehlinterpretiert worden sein → mehr Kontext laden
+        # Bei positivem Heat (stärker beobachten) immer Recheck erzwingen
         recheck_thr = settings.context_recheck_confidence
         needs_recheck = (
             decision.moderation_decision in (ModerationDecision.WARN, ModerationDecision.DELETE)
-            and decision.confidence < recheck_thr
+            and (decision.confidence < recheck_thr or heat_mod < 0)
         )
         if needs_recheck:
             ext_limit = settings.context_message_count_extended
@@ -636,12 +646,7 @@ class ModerationCog(commands.Cog):
 
         try:
             if d.moderation_decision == ModerationDecision.WARN:
-                await self._send_user_notice(
-                    message,
-                    d.user_facing_message or d.reason,
-                    decision=d.moderation_decision,
-                    violated_rule_ids=d.violated_rule_ids,
-                )
+                # Warn: kein DM — nur Mod-Log, um DM-Flooding zu vermeiden
                 await db.add_warning(
                     guild.id,
                     message.author.id,
@@ -809,6 +814,7 @@ class ModerationCog(commands.Cog):
             text,
             decision,
             violated_rule_ids=violated_rule_ids,
+            message_content=message.content or None,
         )
         member = message.author
         try:
