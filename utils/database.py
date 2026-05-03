@@ -174,6 +174,9 @@ class ModerationDatabase:
         vt_malicious_threshold: int | None = None,
         vt_suspicious_threshold: int | None = None,
         mod_embed_delete_after_seconds: Any = _UNSET,
+        review_inbox_channel_id: Any = _UNSET,
+        review_approved_channel_id: Any = _UNSET,
+        review_declined_channel_id: Any = _UNSET,
     ) -> None:
         current = await self.get_guild_config(guild_id)
         merged = {
@@ -228,6 +231,15 @@ class ModerationDatabase:
             "mod_embed_delete_after_seconds": current.get("mod_embed_delete_after_seconds")
             if mod_embed_delete_after_seconds is _UNSET
             else mod_embed_delete_after_seconds,
+            "review_inbox_channel_id": current.get("review_inbox_channel_id")
+            if review_inbox_channel_id is _UNSET
+            else review_inbox_channel_id,
+            "review_approved_channel_id": current.get("review_approved_channel_id")
+            if review_approved_channel_id is _UNSET
+            else review_approved_channel_id,
+            "review_declined_channel_id": current.get("review_declined_channel_id")
+            if review_declined_channel_id is _UNSET
+            else review_declined_channel_id,
         }
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
@@ -240,8 +252,9 @@ class ModerationDatabase:
                     review_queue_enabled, review_confidence_floor, report_channel_id,
                     url_scan_enabled, url_allowlist_domains,
                     vt_malicious_threshold, vt_suspicious_threshold,
-                    mod_embed_delete_after_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mod_embed_delete_after_seconds,
+                    review_inbox_channel_id, review_approved_channel_id, review_declined_channel_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     server_rules = excluded.server_rules,
                     confidence_threshold = excluded.confidence_threshold,
@@ -261,7 +274,10 @@ class ModerationDatabase:
                     url_allowlist_domains = excluded.url_allowlist_domains,
                     vt_malicious_threshold = excluded.vt_malicious_threshold,
                     vt_suspicious_threshold = excluded.vt_suspicious_threshold,
-                    mod_embed_delete_after_seconds = excluded.mod_embed_delete_after_seconds
+                    mod_embed_delete_after_seconds = excluded.mod_embed_delete_after_seconds,
+                    review_inbox_channel_id = excluded.review_inbox_channel_id,
+                    review_approved_channel_id = excluded.review_approved_channel_id,
+                    review_declined_channel_id = excluded.review_declined_channel_id
                 """,
                 (
                     guild_id,
@@ -284,6 +300,9 @@ class ModerationDatabase:
                     merged["vt_malicious_threshold"],
                     merged["vt_suspicious_threshold"],
                     merged["mod_embed_delete_after_seconds"],
+                    merged["review_inbox_channel_id"],
+                    merged["review_approved_channel_id"],
+                    merged["review_declined_channel_id"],
                 ),
             )
             await db.commit()
@@ -838,6 +857,9 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         ("vt_malicious_threshold", "INTEGER NOT NULL DEFAULT 1"),
         ("vt_suspicious_threshold", "INTEGER NOT NULL DEFAULT 3"),
         ("mod_embed_delete_after_seconds", "INTEGER"),
+        ("review_inbox_channel_id", "INTEGER"),
+        ("review_approved_channel_id", "INTEGER"),
+        ("review_declined_channel_id", "INTEGER"),
     ]
     for name, decl in alters:
         if name not in cols:
@@ -893,6 +915,9 @@ def _default_guild_config(guild_id: int) -> dict[str, Any]:
         "vt_malicious_threshold": 1,
         "vt_suspicious_threshold": 3,
         "mod_embed_delete_after_seconds": None,
+        "review_inbox_channel_id": None,
+        "review_approved_channel_id": None,
+        "review_declined_channel_id": None,
     }
 
 
@@ -938,6 +963,15 @@ def _row_to_guild_config(row: dict[str, Any]) -> dict[str, Any]:
         "vt_suspicious_threshold": int(r.get("vt_suspicious_threshold", 3)),
         "mod_embed_delete_after_seconds": int(m)
         if (m := r.get("mod_embed_delete_after_seconds")) is not None
+        else None,
+        "review_inbox_channel_id": int(ri)
+        if (ri := r.get("review_inbox_channel_id")) is not None
+        else None,
+        "review_approved_channel_id": int(ra)
+        if (ra := r.get("review_approved_channel_id")) is not None
+        else None,
+        "review_declined_channel_id": int(rd)
+        if (rd := r.get("review_declined_channel_id")) is not None
         else None,
     }
 

@@ -65,6 +65,9 @@ def _cfg_embed(guild: discord.Guild, cfg: dict[str, Any]) -> discord.Embed:
     # Kanäle
     modlog = cfg.get("mod_log_channel_id")
     report = cfg.get("report_channel_id")
+    rv_inbox = cfg.get("review_inbox_channel_id")
+    rv_appr = cfg.get("review_approved_channel_id")
+    rv_decl = cfg.get("review_declined_channel_id")
     emb.add_field(
         name="Mod-Log-Kanal",
         value=f"<#{modlog}>" if modlog else "–",
@@ -73,6 +76,21 @@ def _cfg_embed(guild: discord.Guild, cfg: dict[str, Any]) -> discord.Embed:
     emb.add_field(
         name="Report-Kanal",
         value=f"<#{report}>" if report else "–",
+        inline=True,
+    )
+    emb.add_field(
+        name="Review-Eingang",
+        value=f"<#{rv_inbox}>" if rv_inbox else "– (Fallback: Mod-Log)",
+        inline=True,
+    )
+    emb.add_field(
+        name="Review Bestätigt →",
+        value=f"<#{rv_appr}>" if rv_appr else "– (Fallback: Mod-Log)",
+        inline=True,
+    )
+    emb.add_field(
+        name="Review Abgelehnt →",
+        value=f"<#{rv_decl}>" if rv_decl else "– (Fallback: Mod-Log)",
         inline=True,
     )
 
@@ -284,7 +302,7 @@ class _KanaeleView(discord.ui.View):
         super().__init__(timeout=300.0)
         self._p = parent
 
-    @discord.ui.button(label="Mod-Log-Kanal setzen", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Mod-Log-Kanal", style=discord.ButtonStyle.primary, row=0)
     async def set_modlog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         cfg = await self._p._get_cfg(interaction)
         if cfg is None:
@@ -297,7 +315,7 @@ class _KanaeleView(discord.ui.View):
             val = f"<#{modal._result}>" if modal._result else "–"
             await self._p._refresh(None, f"Mod-Log-Kanal: **{val}**.", guild=interaction.guild)
 
-    @discord.ui.button(label="Report-Kanal setzen", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Report-Kanal", style=discord.ButtonStyle.primary, row=0)
     async def set_report(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         cfg = await self._p._get_cfg(interaction)
         if cfg is None:
@@ -309,6 +327,45 @@ class _KanaeleView(discord.ui.View):
             await self._p.bot.db.upsert_guild_config(interaction.guild.id, report_channel_id=modal._result)  # type: ignore[union-attr]
             val = f"<#{modal._result}>" if modal._result else "–"
             await self._p._refresh(None, f"Report-Kanal: **{val}**.", guild=interaction.guild)
+
+    @discord.ui.button(label="Review-Eingang", style=discord.ButtonStyle.secondary, row=1)
+    async def set_review_inbox(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        cfg = await self._p._get_cfg(interaction)
+        if cfg is None:
+            return
+        modal = _ChannelIdModal("Review-Eingangskanal", cfg.get("review_inbox_channel_id"))
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+        if modal._result is not _UNSET_SENTINEL:
+            await self._p.bot.db.upsert_guild_config(interaction.guild.id, review_inbox_channel_id=modal._result)  # type: ignore[union-attr]
+            val = f"<#{modal._result}>" if modal._result else "– (Fallback: Mod-Log)"
+            await self._p._refresh(None, f"Review-Eingangskanal: **{val}**.", guild=interaction.guild)
+
+    @discord.ui.button(label="Review Bestätigt →", style=discord.ButtonStyle.secondary, row=1)
+    async def set_review_approved(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        cfg = await self._p._get_cfg(interaction)
+        if cfg is None:
+            return
+        modal = _ChannelIdModal("Review-Bestätigungskanal", cfg.get("review_approved_channel_id"))
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+        if modal._result is not _UNSET_SENTINEL:
+            await self._p.bot.db.upsert_guild_config(interaction.guild.id, review_approved_channel_id=modal._result)  # type: ignore[union-attr]
+            val = f"<#{modal._result}>" if modal._result else "– (Fallback: Mod-Log)"
+            await self._p._refresh(None, f"Review-Bestätigungskanal: **{val}**.", guild=interaction.guild)
+
+    @discord.ui.button(label="Review Abgelehnt →", style=discord.ButtonStyle.secondary, row=2)
+    async def set_review_declined(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        cfg = await self._p._get_cfg(interaction)
+        if cfg is None:
+            return
+        modal = _ChannelIdModal("Review-Ablehnungskanal", cfg.get("review_declined_channel_id"))
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+        if modal._result is not _UNSET_SENTINEL:
+            await self._p.bot.db.upsert_guild_config(interaction.guild.id, review_declined_channel_id=modal._result)  # type: ignore[union-attr]
+            val = f"<#{modal._result}>" if modal._result else "– (Fallback: Mod-Log)"
+            await self._p._refresh(None, f"Review-Ablehnungskanal: **{val}**.", guild=interaction.guild)
 
     @discord.ui.button(label="← Zurück", style=discord.ButtonStyle.danger, row=4)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:

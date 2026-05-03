@@ -309,6 +309,63 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
+    @mod_config.command(name="review-inbox-channel", description="Kanal für eingehende Review-Anfragen")
+    @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
+    @_manage_guild_check()
+    async def mod_config_review_inbox(
+        self,
+        interaction: discord.Interaction,
+        kanal: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if interaction.guild is None or self.bot.db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id, review_inbox_channel_id=kanal.id if kanal else None
+        )
+        await interaction.response.send_message(
+            f"Review-Eingangskanal: {f'<#{kanal.id}>' if kanal else '(zurückgesetzt — Fallback auf Mod-Log)'}.",
+            ephemeral=True,
+        )
+
+    @mod_config.command(name="review-approved-channel", description="Kanal für bestätigte Review-Ergebnisse")
+    @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
+    @_manage_guild_check()
+    async def mod_config_review_approved(
+        self,
+        interaction: discord.Interaction,
+        kanal: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if interaction.guild is None or self.bot.db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id, review_approved_channel_id=kanal.id if kanal else None
+        )
+        await interaction.response.send_message(
+            f"Review-Bestätigungskanal: {f'<#{kanal.id}>' if kanal else '(zurückgesetzt — Fallback auf Mod-Log)'}.",
+            ephemeral=True,
+        )
+
+    @mod_config.command(name="review-declined-channel", description="Kanal für abgelehnte Review-Ergebnisse")
+    @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
+    @_manage_guild_check()
+    async def mod_config_review_declined(
+        self,
+        interaction: discord.Interaction,
+        kanal: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if interaction.guild is None or self.bot.db is None:
+            await interaction.response.send_message("Dienst nicht verfügbar.", ephemeral=True)
+            return
+        await self.bot.db.upsert_guild_config(
+            interaction.guild.id, review_declined_channel_id=kanal.id if kanal else None
+        )
+        await interaction.response.send_message(
+            f"Review-Ablehnungskanal: {f'<#{kanal.id}>' if kanal else '(zurückgesetzt — Fallback auf Mod-Log)'}.",
+            ephemeral=True,
+        )
+
     @mod_config.command(
         name="url-scan",
         description="VirusTotal-URL-Prüfung (nur mit VIRUSTOTAL_API_KEY im Bot; pro Domain-Allowlist)",
