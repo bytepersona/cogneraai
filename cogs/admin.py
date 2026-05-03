@@ -95,6 +95,11 @@ class AdminCog(commands.Cog):
         description="KI-Moderation und Server-Regeln konfigurieren",
     )
 
+    review_config = app_commands.Group(
+        name="review-config",
+        description="Review-Queue-Kanäle und -Schwellen konfigurieren",
+    )
+
     @mod_config.command(name="rules", description="Server-Regeln für ModeratorAI setzen")
     @app_commands.describe(regeln="Voller Text der Hausregeln (Platzhalter im System-Prompt)")
     @_manage_guild_check()
@@ -277,7 +282,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @mod_config.command(name="review-queue", description="Review-Warteschlange für Ban/low confidence aktivieren")
+    @review_config.command(name="queue", description="Review-Warteschlange für Ban/low confidence aktivieren")
     @app_commands.describe(aktiv="True = kritische Fälle als Buttons im Mod-Log")
     @_manage_guild_check()
     async def mod_config_review_queue(self, interaction: discord.Interaction, aktiv: bool) -> None:
@@ -290,7 +295,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @mod_config.command(name="review-floor", description="Unter dieser Confidence → Review-Queue (zusätzlich zu Ban)")
+    @review_config.command(name="floor", description="Unter dieser Confidence → Review-Queue (zusätzlich zu Ban)")
     @app_commands.describe(wert="0–100")
     @_manage_guild_check()
     async def mod_config_review_floor(self, interaction: discord.Interaction, wert: int) -> None:
@@ -332,7 +337,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @mod_config.command(name="review-inbox-channel", description="Kanal für eingehende Review-Anfragen")
+    @review_config.command(name="inbox-channel", description="Kanal für eingehende Review-Anfragen")
     @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
     @_manage_guild_check()
     async def mod_config_review_inbox(
@@ -351,7 +356,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @mod_config.command(name="review-approved-channel", description="Kanal für bestätigte Review-Ergebnisse")
+    @review_config.command(name="approved-channel", description="Kanal für bestätigte Review-Ergebnisse")
     @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
     @_manage_guild_check()
     async def mod_config_review_approved(
@@ -370,7 +375,7 @@ class AdminCog(commands.Cog):
             ephemeral=True,
         )
 
-    @mod_config.command(name="review-declined-channel", description="Kanal für abgelehnte Review-Ergebnisse")
+    @review_config.command(name="declined-channel", description="Kanal für abgelehnte Review-Ergebnisse")
     @app_commands.describe(kanal="Textkanal (leer = Fallback auf Mod-Log-Kanal)")
     @_manage_guild_check()
     async def mod_config_review_declined(
