@@ -52,6 +52,48 @@ async def test_default_guild_config(db_path):
     cfg = await db.get_guild_config(12345)
     assert "ai_enabled" in cfg
     assert "confidence_threshold" in cfg
+    assert str(cfg.get("server_rules", "")).startswith("Server-Regeln")
+
+
+@pytest.mark.asyncio
+async def test_migration_replaces_placeholder_server_rules(db_path):
+    import aiosqlite
+
+    from utils.default_server_rules import CANONICAL_SERVER_RULES_TEXT
+
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.executescript(
+            """
+            CREATE TABLE guild_config (
+                guild_id INTEGER PRIMARY KEY,
+                server_rules TEXT NOT NULL DEFAULT '',
+                confidence_threshold INTEGER NOT NULL DEFAULT 75,
+                default_timeout_minutes INTEGER NOT NULL DEFAULT 10,
+                mod_log_channel_id INTEGER,
+                whitelist_user_ids TEXT NOT NULL DEFAULT '[]',
+                whitelist_role_ids TEXT NOT NULL DEFAULT '[]',
+                whitelist_channel_ids TEXT NOT NULL DEFAULT '[]',
+                ai_enabled INTEGER NOT NULL DEFAULT 1,
+                dry_run INTEGER NOT NULL DEFAULT 0,
+                strike_escalation_enabled INTEGER NOT NULL DEFAULT 0,
+                strike_escalation_json TEXT NOT NULL DEFAULT '',
+                review_queue_enabled INTEGER NOT NULL DEFAULT 1,
+                review_confidence_floor INTEGER NOT NULL DEFAULT 50,
+                report_channel_id INTEGER,
+                url_scan_enabled INTEGER NOT NULL DEFAULT 0,
+                url_allowlist_domains TEXT NOT NULL DEFAULT '[]',
+                vt_malicious_threshold INTEGER NOT NULL DEFAULT 1,
+                vt_suspicious_threshold INTEGER NOT NULL DEFAULT 3,
+                mod_embed_delete_after_seconds INTEGER
+            );
+            INSERT INTO guild_config (guild_id, server_rules) VALUES (1, '(Noch keine Regeln gesetzt — nutze /mod-config um Verhaltensregeln zu hinterlegen.)');
+            """
+        )
+        await conn.commit()
+
+    db = await _make_db(db_path)
+    cfg = await db.get_guild_config(1)
+    assert cfg["server_rules"].strip() == CANONICAL_SERVER_RULES_TEXT.strip()
 
 
 @pytest.mark.asyncio

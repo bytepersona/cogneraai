@@ -18,6 +18,7 @@ from typing import Any, Optional
 import aiosqlite
 
 from utils.config import Settings
+from utils.default_server_rules import CANONICAL_SERVER_RULES_TEXT
 from utils.strike_escalation import default_strike_escalation_json
 from utils.url_allowlist import default_url_allowlist
 
@@ -861,13 +862,19 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
     if "case_ref" not in rq_cols:
         await db.execute("ALTER TABLE review_queue ADD COLUMN case_ref TEXT")
 
+    _old_rules_placeholder = (
+        "(Noch keine Regeln gesetzt — nutze /mod-config um Verhaltensregeln zu hinterlegen.)"
+    )
+    await db.execute(
+        "UPDATE guild_config SET server_rules = ? WHERE server_rules = ?",
+        (CANONICAL_SERVER_RULES_TEXT.strip(), _old_rules_placeholder),
+    )
+
 
 def _default_guild_config(guild_id: int) -> dict[str, Any]:
     return {
         "guild_id": guild_id,
-        "server_rules": (
-            "(Noch keine Regeln gesetzt — nutze /mod-config um Verhaltensregeln zu hinterlegen.)"
-        ),
+        "server_rules": CANONICAL_SERVER_RULES_TEXT.strip(),
         "confidence_threshold": 75,
         "default_timeout_minutes": 10,
         "mod_log_channel_id": None,

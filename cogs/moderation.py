@@ -17,6 +17,7 @@ from discord.ext import commands
 
 from core_bot import ModerationBot
 from utils.circuit_breaker import CircuitOpenError
+from utils.default_server_rules import format_rule_ids_line
 from utils.discord_embeds import build_mod_log_embed, build_user_notice_embed
 from utils.models import ClaudeModerationResponse, ModerationDecision, Severity
 from utils.moderation_jobs import ModerationJob
@@ -32,6 +33,13 @@ logger = logging.getLogger(__name__)
 def _moderation_eval_json(d: ClaudeModerationResponse) -> str:
     """Serielle Auswertung für DB und „See Evaluation“."""
     return json.dumps(d.model_dump(mode="json"), ensure_ascii=False)
+
+
+def _rule_ids_footer(d: ClaudeModerationResponse) -> str:
+    ids = d.violated_rule_ids or []
+    if not ids:
+        return ""
+    return f" | Regeln: {format_rule_ids_line(ids)}"
 
 
 def _message_snapshot(message: discord.Message) -> str:
@@ -191,7 +199,7 @@ class ModerationCog(commands.Cog):
                     message.guild.id,
                     message.author.id,
                     "review_queued",
-                    effective.reason,
+                    (effective.reason or "") + _rule_ids_footer(effective),
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=f"queue_id={qid} | strikes={new_strikes} | url_scan=vt",
@@ -264,14 +272,14 @@ class ModerationCog(commands.Cog):
             await self._post_review_embed(
                 message, decision, effective, gcfg, qid, case_ref=case_ref, event_ref=event_ref
             )
-            await db.add_mod_log(
-                message.guild.id,
-                message.author.id,
-                "review_queued",
-                effective.reason,
-                channel_id=message.channel.id,
-                actor_id=None,
-                details=f"queue_id={qid} | strikes={new_strikes}",
+                await db.add_mod_log(
+                    message.guild.id,
+                    message.author.id,
+                    "review_queued",
+                    (effective.reason or "") + _rule_ids_footer(effective),
+                    channel_id=message.channel.id,
+                    actor_id=None,
+                    details=f"queue_id={qid} | strikes={new_strikes}",
                 case_ref=case_ref,
                 evaluation_json=_moderation_eval_json(effective),
                 message_content_snapshot=_message_snapshot(message),
@@ -328,7 +336,10 @@ class ModerationCog(commands.Cog):
         embed.add_field(name="Nutzer", value=f"{message.author} ({message.author.id})", inline=False)
         embed.add_field(name="Vorschlag (nach Strikes)", value=effective.moderation_decision.value, inline=True)
         embed.add_field(name="Confidence", value=str(orig.confidence), inline=True)
-        embed.add_field(name="Grund", value=(effective.reason or "")[:900], inline=False)
+        grund = (effective.reason or "")[:900]
+        if effective.violated_rule_ids:
+            grund = f"{grund}\n**Regeln:** {format_rule_ids_line(effective.violated_rule_ids)}"[:900]
+        embed.add_field(name="Grund", value=grund or "—", inline=False)
         if case_ref:
             embed.add_field(name="Fall-ID", value=f"`{case_ref}`", inline=True)
         if event_ref:
@@ -428,9 +439,11 @@ class ModerationCog(commands.Cog):
                         f"suspicious={verdict.suspicious}, harmless={verdict.harmless}"
                     ),
                     user_facing_message=(
-                        "Ein Link in deiner Nachricht wurde automatisch als riskant eingestuft."
+                        "Ein Link in deiner Nachricht wurde automatisch als riskant eingestuft "
+                        "(Server-Regeln 3.2.1 / 3.2.2 — Phishing & Scams)."
                     ),
                     requires_manual_review=False,
+                    violated_rule_ids=["3.2.1"],
                 )
         return None
 
@@ -508,7 +521,7 @@ class ModerationCog(commands.Cog):
                 message.guild.id,
                 message.author.id,
                 f"dry_run_{d.moderation_decision.value}",
-                d.reason,
+                (d.reason or "") + _rule_ids_footer(d),
                 channel_id=message.channel.id,
                 actor_id=None,
                 details=f"[DRY-RUN] {log_details}",
@@ -521,13 +534,14 @@ class ModerationCog(commands.Cog):
                 gcfg,
                 decision=d.moderation_decision,
                 target_user=message.author,
-                reason=d.reason,
+                reason=(d.reason or "") + _rule_ids_footer(d),
                 detail=log_details,
                 jump_url=jump_url,
                 simulated=True,
                 timeout_minutes=d.timeout_minutes,
                 case_ref=cr,
                 event_ref=event_ref,
+                violated_rule_ids=d.violated_rule_ids,
             )
             return
 
@@ -542,11 +556,12 @@ class ModerationCog(commands.Cog):
                     message,
                     d.user_facing_message or d.reason,
                     decision=d.moderation_decision,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
                 await db.add_warning(
                     guild.id,
                     message.author.id,
-                    d.reason or "KI-Verwarnung",
+                    (d.reason or "KI-Verwarnung") + _rule_ids_footer(d),
                     moderator_id=None,
                     source="ai",
                 )
@@ -554,7 +569,7 @@ class ModerationCog(commands.Cog):
                     guild.id,
                     message.author.id,
                     "warn",
-                    d.reason,
+                    (d.reason or "") + _rule_ids_footer(d),
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
@@ -567,11 +582,12 @@ class ModerationCog(commands.Cog):
                     gcfg,
                     decision=d.moderation_decision,
                     target_user=message.author,
-                    reason=d.reason,
+                    reason=(d.reason or "") + _rule_ids_footer(d),
                     detail=log_details,
                     jump_url=jump_url,
                     case_ref=cr,
                     event_ref=event_ref,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
 
             elif d.moderation_decision == ModerationDecision.DELETE:
@@ -580,12 +596,13 @@ class ModerationCog(commands.Cog):
                     message,
                     d.user_facing_message or "Deine Nachricht wurde entfernt.",
                     decision=d.moderation_decision,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
                 _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "delete",
-                    d.reason,
+                    (d.reason or "") + _rule_ids_footer(d),
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
@@ -598,11 +615,12 @@ class ModerationCog(commands.Cog):
                     gcfg,
                     decision=d.moderation_decision,
                     target_user=message.author,
-                    reason=d.reason,
+                    reason=(d.reason or "") + _rule_ids_footer(d),
                     detail=log_details,
                     jump_url=jump_url,
                     case_ref=cr,
                     event_ref=event_ref,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
 
             elif d.moderation_decision == ModerationDecision.TIMEOUT:
@@ -611,18 +629,19 @@ class ModerationCog(commands.Cog):
                 if isinstance(member, discord.Member):
                     await member.timeout(
                         timedelta(minutes=minutes),
-                        reason=f"KI-Timeout: {d.reason}",
+                        reason=f"KI-Timeout: {d.reason}{_rule_ids_footer(d)}",
                     )
                 await self._send_user_notice(
                     message,
                     d.user_facing_message or f"Du wurdest für {minutes} Minuten stummgeschaltet.",
                     decision=d.moderation_decision,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
                 _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "timeout",
-                    d.reason,
+                    (d.reason or "") + _rule_ids_footer(d),
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=f"{log_details} | Minuten: {minutes}",
@@ -635,31 +654,32 @@ class ModerationCog(commands.Cog):
                     gcfg,
                     decision=d.moderation_decision,
                     target_user=message.author,
-                    reason=d.reason,
+                    reason=(d.reason or "") + _rule_ids_footer(d),
                     detail=log_details,
                     jump_url=jump_url,
                     timeout_minutes=minutes,
                     case_ref=cr,
                     event_ref=event_ref,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
 
             elif d.moderation_decision == ModerationDecision.BAN:
                 if isinstance(member, discord.Member):
                     await guild.ban(
                         member,
-                        reason=f"KI-Ban: {d.reason}",
+                        reason=f"KI-Ban: {d.reason}{_rule_ids_footer(d)}",
                         delete_message_days=1,
                     )
                 else:
                     await guild.ban(
                         discord.Object(id=message.author.id),
-                        reason=f"KI-Ban: {d.reason}",
+                        reason=f"KI-Ban: {d.reason}{_rule_ids_footer(d)}",
                     )
                 _, cr = await db.add_mod_log(
                     guild.id,
                     message.author.id,
                     "ban",
-                    d.reason,
+                    (d.reason or "") + _rule_ids_footer(d),
                     channel_id=message.channel.id,
                     actor_id=None,
                     details=log_details,
@@ -672,11 +692,12 @@ class ModerationCog(commands.Cog):
                     gcfg,
                     decision=d.moderation_decision,
                     target_user=message.author,
-                    reason=d.reason,
+                    reason=(d.reason or "") + _rule_ids_footer(d),
                     detail=log_details,
                     jump_url=jump_url,
                     case_ref=cr,
                     event_ref=event_ref,
+                    violated_rule_ids=d.violated_rule_ids,
                 )
 
         except discord.Forbidden:
@@ -696,10 +717,15 @@ class ModerationCog(commands.Cog):
         text: str,
         *,
         decision: ModerationDecision,
+        violated_rule_ids: Optional[list[str]] = None,
     ) -> None:
         if not text:
             return
-        embed = build_user_notice_embed(text, decision)
+        embed = build_user_notice_embed(
+            text,
+            decision,
+            violated_rule_ids=violated_rule_ids,
+        )
         member = message.author
         try:
             if isinstance(member, discord.Member):
@@ -730,6 +756,7 @@ class ModerationCog(commands.Cog):
         timeout_minutes: Optional[int] = None,
         case_ref: Optional[str] = None,
         event_ref: Optional[str] = None,
+        violated_rule_ids: Optional[list[str]] = None,
     ) -> None:
         cid = gcfg.get("mod_log_channel_id")
         if not cid:
@@ -748,6 +775,7 @@ class ModerationCog(commands.Cog):
             timeout_minutes=timeout_minutes,
             case_ref=case_ref,
             event_ref=event_ref,
+            violated_rule_ids=violated_rule_ids,
         )
         delete_after = self._resolve_embed_delete_after(gcfg)
         try:

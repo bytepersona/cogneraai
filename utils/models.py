@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from utils.default_server_rules import normalize_violated_rule_ids
+
 
 class Severity(str, Enum):
     NONE = "none"
@@ -42,6 +44,12 @@ class ClaudeModerationResponse(BaseModel):
     timeout_minutes: Optional[int] = Field(None, alias="timeout_minutes")
     user_facing_message: str = Field("", alias="user_facing_message")
     requires_manual_review: bool = Field(False, alias="requires_manual_review")
+    violated_rule_ids: list[str] = Field(default_factory=list, alias="violated_rule_ids")
+
+    @field_validator("violated_rule_ids", mode="before")
+    @classmethod
+    def _normalize_violated_rule_ids(cls, v: Any) -> list[str]:
+        return normalize_violated_rule_ids(v)
 
     @field_validator("timeout_minutes", mode="before")
     @classmethod
@@ -59,6 +67,7 @@ class ClaudeModerationResponse(BaseModel):
             "userFacingMessage": "user_facing_message",
             "requiresManualReview": "requires_manual_review",
             "timeoutMinutes": "timeout_minutes",
+            "violatedRuleIds": "violated_rule_ids",
         }
         for old, new in key_map.items():
             if old in normalized and new not in normalized:

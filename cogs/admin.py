@@ -1111,6 +1111,7 @@ class AdminCog(commands.Cog):
             severity=getattr(result.severity, "value", str(result.severity)),
             reason=result.reason,
             requires_manual_review=result.requires_manual_review,
+            violated_rule_ids=result.violated_rule_ids,
         )
         view = CheckEvaluationView(json_text=out, ts_iso=ts)
         await interaction.followup.send(embed=emb, view=view, ephemeral=True)
