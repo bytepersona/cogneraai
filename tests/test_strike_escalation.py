@@ -19,9 +19,9 @@ def _make_response(decision: ModerationDecision) -> ClaudeModerationResponse:
         severity=Severity.HIGH,
         reason="Test",
         explanation="Test",
-        violates_rules=True,
         requires_manual_review=False,
         timeout_minutes=10 if decision == ModerationDecision.TIMEOUT else None,
+        violated_rule_ids=["1.1.1"],
     )
 
 

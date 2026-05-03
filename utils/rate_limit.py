@@ -25,8 +25,3 @@ class SlidingWindowRateLimiter:
             return False
         bucket.append(t)
         return True
-
-
-def monotonic_now() -> float:
-    """Test-Hook."""
-    return time.monotonic()

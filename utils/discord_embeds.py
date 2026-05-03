@@ -7,6 +7,7 @@ from typing import Optional
 
 import discord
 
+from utils.default_server_rules import format_rule_ids_line, format_rule_ids_with_labels, normalize_violated_rule_ids
 from utils.models import ModerationDecision
 
 FOOTER_USER = "ModeratorAI · Automatische Moderation"
@@ -47,9 +48,20 @@ def title_for_mod_log(d: ModerationDecision, *, simulated: bool) -> str:
     return titles.get(d, f"{prefix}Moderation")
 
 
-def build_user_notice_embed(text: str, decision: ModerationDecision) -> discord.Embed:
+def build_user_notice_embed(
+    text: str,
+    decision: ModerationDecision,
+    *,
+    violated_rule_ids: Optional[list[str]] = None,
+) -> discord.Embed:
     """Embed für DM oder öffentlichen Fallback bei Moderationshinweisen."""
-    body = (text or "").strip()[:4096]
+    body = (text or "").strip()
+    ids = normalize_violated_rule_ids(violated_rule_ids or [])
+    if ids:
+        suffix = f"\n\n**Betroffene Server-Regeln:** {format_rule_ids_line(ids)}"
+        room = max(0, 4096 - len(suffix))
+        body = (body[:room] + suffix) if body else suffix.strip()
+    body = body[:4096]
     embed = discord.Embed(
         title=title_for_user_notice(decision),
         description=body if body else "—",
@@ -71,6 +83,7 @@ def build_mod_log_embed(
     timeout_minutes: Optional[int] = None,
     case_ref: Optional[str] = None,
     event_ref: Optional[str] = None,
+    violated_rule_ids: Optional[list[str]] = None,
 ) -> discord.Embed:
     """Embed für den konfigurierten Mod-Log-Kanal."""
     embed = discord.Embed(
@@ -96,6 +109,14 @@ def build_mod_log_embed(
 
     reason_fmt = (reason or "—").strip()[:1024]
     embed.add_field(name="Grund", value=reason_fmt or "—", inline=False)
+
+    ids = normalize_violated_rule_ids(violated_rule_ids or [])
+    if ids:
+        embed.add_field(
+            name="Server-Regeln",
+            value=format_rule_ids_with_labels(ids)[:1024],
+            inline=False,
+        )
 
     if detail:
         embed.add_field(
@@ -123,6 +144,7 @@ def build_check_result_embed(
     severity: str,
     reason: str,
     requires_manual_review: bool,
+    violated_rule_ids: Optional[list[str]] = None,
 ) -> discord.Embed:
     """Slash /check: Kurzfassung; volles JSON über Button."""
     emb = discord.Embed(
@@ -136,6 +158,13 @@ def build_check_result_embed(
     emb.add_field(name="Review", value="ja" if requires_manual_review else "nein", inline=True)
     emb.add_field(name="Text (Ausschnitt)", value=(text_preview[:900] if text_preview else "—"), inline=False)
     emb.add_field(name="Begründung", value=(reason or "—")[:1024], inline=False)
+    ids = normalize_violated_rule_ids(violated_rule_ids or [])
+    if ids:
+        emb.add_field(
+            name="Server-Regeln",
+            value=format_rule_ids_with_labels(ids)[:1024],
+            inline=False,
+        )
     emb.set_footer(text="ModeratorAI · /check")
     emb.timestamp = discord.utils.utcnow()
     return emb
@@ -156,12 +185,14 @@ def build_case_browser_embed(
 ) -> discord.Embed:
     """Slash /cases: ein gespeicherter Fall aus der Datenbank."""
     color = discord.Color.blurple()
+    parsed_ids: list[str] = []
     if evaluation_json:
         try:
             data = json.loads(evaluation_json)
             md = data.get("moderation_decision")
             if md:
                 color = color_for_decision(ModerationDecision(md))
+            parsed_ids = normalize_violated_rule_ids(data.get("violated_rule_ids"))
         except (json.JSONDecodeError, ValueError):
             pass
     emb = discord.Embed(title=f"Moderationsfall `{case_label}`", color=color)
@@ -176,6 +207,12 @@ def build_case_browser_embed(
     snap = (message_snapshot or "").strip() or "—"
     emb.add_field(name="Nachricht (Snapshot)", value=snap[:1024], inline=False)
     emb.add_field(name="Grund", value=(reason or "—")[:1024], inline=False)
+    if parsed_ids:
+        emb.add_field(
+            name="Server-Regeln",
+            value=format_rule_ids_with_labels(parsed_ids)[:1024],
+            inline=False,
+        )
     if details:
         emb.add_field(name="Details / Log", value=details[:1024], inline=False)
     emb.set_footer(text=f"log_id={log_id} · {created_at_iso}")

@@ -31,11 +31,6 @@ class UrlScanVerdict:
     undetected: int
     permalink: Optional[str]
 
-    @property
-    def is_positive(self) -> bool:
-        """True wenn genügend Engines Alarm schlagen (policy extern)."""
-        return self.malicious > 0 or self.suspicious > 0
-
 
 class VirusTotalClient:
     def __init__(
