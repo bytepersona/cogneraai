@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import discord
@@ -52,17 +52,37 @@ class ModerationCog(commands.Cog):
     def __init__(self, bot: ModerationBot) -> None:
         self.bot = bot
         self._worker_task: Optional[asyncio.Task] = None
+        self._heat_cleanup_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         self._worker_task = asyncio.create_task(self._moderation_worker())
+        self._heat_cleanup_task = asyncio.create_task(self._heat_cleanup_loop())
 
     async def cog_unload(self) -> None:
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._worker_task, self._heat_cleanup_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _heat_cleanup_loop(self) -> None:
+        """Räumt abgelaufene Heat-Einträge alle 6 Stunden auf."""
+        await asyncio.sleep(300)  # kurzer Verzögerungsstart nach Bot-Start
+        while True:
+            db = self.bot.db
+            if db is not None:
+                try:
+                    guilds = self.bot.guilds
+                    total = 0
+                    for guild in guilds:
+                        total += await db.clear_expired_heat(guild.id)
+                    if total:
+                        logger.info("Heat-Cleanup: %d abgelaufene Einträge entfernt.", total)
+                except Exception:
+                    logger.exception("Heat-Cleanup fehlgeschlagen.")
+            await asyncio.sleep(6 * 3600)
 
     async def _moderation_worker(self) -> None:
         q = self.bot.moderation_queue
@@ -256,7 +276,7 @@ class ModerationCog(commands.Cog):
 
         # Kontextneuprüfung: bei warn/delete mit niedriger Confidence könnten
         # Witze oder Ironie fehlinterpretiert worden sein → mehr Kontext laden
-        # Bei positivem Heat (stärker beobachten) immer Recheck erzwingen
+        # Bei negativem Heat-Modifier (Visier entfernen) Recheck immer erzwingen
         recheck_thr = settings.context_recheck_confidence
         needs_recheck = (
             decision.moderation_decision in (ModerationDecision.WARN, ModerationDecision.DELETE)
@@ -568,11 +588,9 @@ class ModerationCog(commands.Cog):
 
             # Zeitdifferenz berechnen damit Claude alte Nachrichten einordnen kann
             try:
-                from datetime import datetime
                 msg_dt = datetime.fromisoformat(m.created_at_iso)
                 if msg_dt.tzinfo is None:
-                    from datetime import timezone as _tz
-                    msg_dt = msg_dt.replace(tzinfo=_tz.utc)
+                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
                 age_h = (now_utc - msg_dt).total_seconds() / 3600
                 if age_h > 48:
                     age_str = f" [vor {age_h / 24:.0f}d]"

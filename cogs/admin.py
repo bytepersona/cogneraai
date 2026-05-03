@@ -572,7 +572,7 @@ class AdminCog(commands.Cog):
             inline=True,
         )
 
-        strikes_enabled = yn(cfg.get("strike_escalation_enabled", True))
+        strikes_enabled = yn(cfg.get("strike_escalation_enabled", False))
         emb.add_field(name="Strike-Eskalation", value=strikes_enabled, inline=True)
 
         emb.timestamp = discord.utils.utcnow()
