@@ -245,6 +245,47 @@ class ModerationCog(commands.Cog):
         if decision.moderation_decision == ModerationDecision.ALLOW:
             return
 
+        # Kontextneuprüfung: bei warn/delete mit niedriger Confidence könnten
+        # Witze oder Ironie fehlinterpretiert worden sein → mehr Kontext laden
+        recheck_thr = settings.context_recheck_confidence
+        needs_recheck = (
+            decision.moderation_decision in (ModerationDecision.WARN, ModerationDecision.DELETE)
+            and decision.confidence < recheck_thr
+        )
+        if needs_recheck:
+            ext_limit = settings.context_message_count_extended
+            if ext_limit > ctx_limit:
+                extended_recent = await db.fetch_recent_messages(message.channel.id, ext_limit)
+                ext_system_prompt = MODERATOR_AI_SYSTEM_PROMPT.format(
+                    server_rules=gcfg["server_rules"],
+                    context_block=self._format_context(extended_recent, warnings_block, message),
+                )
+                try:
+                    async def _call_ext() -> ClaudeModerationResponse:
+                        return await ai.moderate(
+                            system_prompt=ext_system_prompt,
+                            user_payload=user_payload,
+                            guild_confidence_threshold=thr,
+                        )
+
+                    ext_decision = await breaker.call(_call_ext)
+                    logger.info(
+                        "Kontextneuprüfung (msg %s): %s→%s conf=%s→%s",
+                        message.id,
+                        decision.moderation_decision.value,
+                        ext_decision.moderation_decision.value,
+                        decision.confidence,
+                        ext_decision.confidence,
+                    )
+                    decision = ext_decision
+                except CircuitOpenError:
+                    logger.warning("Anthropic-Circuit offen — Neuprüfung übersprungen (msg %s).", message.id)
+                except Exception:
+                    logger.exception("Kontextneuprüfung fehlgeschlagen für Message %s", message.id)
+
+        if decision.moderation_decision == ModerationDecision.ALLOW:
+            return
+
         case_ref = await db.allocate_case_ref(message.guild.id)
         new_strikes = await db.increment_user_strike(message.guild.id, message.author.id)
         if gcfg.get("strike_escalation_enabled"):
