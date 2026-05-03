@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     message_cache_ttl_seconds: int = Field(default=30, ge=0)
     context_message_count: int = Field(default=20, ge=5, le=50)
 
+    # Zweite Kontext-Runde bei Verdacht auf Humor/Ironie
+    context_message_count_extended: int = Field(default=40, ge=10, le=100)
+    # Entscheidungen < dieser Confidence bei warn/delete → erneute Prüfung mit mehr Kontext
+    context_recheck_confidence: int = Field(default=82, ge=50, le=99)
+
     moderation_queue_max: int = Field(default=500, ge=10, le=50_000)
     anthropic_circuit_failure_threshold: int = Field(default=5, ge=1, le=100)
     anthropic_circuit_reset_seconds: float = Field(default=60.0, ge=5.0, le=3600.0)

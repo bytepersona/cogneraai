@@ -174,6 +174,9 @@ class ModerationDatabase:
         vt_malicious_threshold: int | None = None,
         vt_suspicious_threshold: int | None = None,
         mod_embed_delete_after_seconds: Any = _UNSET,
+        review_inbox_channel_id: Any = _UNSET,
+        review_approved_channel_id: Any = _UNSET,
+        review_declined_channel_id: Any = _UNSET,
     ) -> None:
         current = await self.get_guild_config(guild_id)
         merged = {
@@ -228,6 +231,15 @@ class ModerationDatabase:
             "mod_embed_delete_after_seconds": current.get("mod_embed_delete_after_seconds")
             if mod_embed_delete_after_seconds is _UNSET
             else mod_embed_delete_after_seconds,
+            "review_inbox_channel_id": current.get("review_inbox_channel_id")
+            if review_inbox_channel_id is _UNSET
+            else review_inbox_channel_id,
+            "review_approved_channel_id": current.get("review_approved_channel_id")
+            if review_approved_channel_id is _UNSET
+            else review_approved_channel_id,
+            "review_declined_channel_id": current.get("review_declined_channel_id")
+            if review_declined_channel_id is _UNSET
+            else review_declined_channel_id,
         }
         async with aiosqlite.connect(self._db_path) as db:
             await db.execute(
@@ -240,8 +252,9 @@ class ModerationDatabase:
                     review_queue_enabled, review_confidence_floor, report_channel_id,
                     url_scan_enabled, url_allowlist_domains,
                     vt_malicious_threshold, vt_suspicious_threshold,
-                    mod_embed_delete_after_seconds
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    mod_embed_delete_after_seconds,
+                    review_inbox_channel_id, review_approved_channel_id, review_declined_channel_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     server_rules = excluded.server_rules,
                     confidence_threshold = excluded.confidence_threshold,
@@ -261,7 +274,10 @@ class ModerationDatabase:
                     url_allowlist_domains = excluded.url_allowlist_domains,
                     vt_malicious_threshold = excluded.vt_malicious_threshold,
                     vt_suspicious_threshold = excluded.vt_suspicious_threshold,
-                    mod_embed_delete_after_seconds = excluded.mod_embed_delete_after_seconds
+                    mod_embed_delete_after_seconds = excluded.mod_embed_delete_after_seconds,
+                    review_inbox_channel_id = excluded.review_inbox_channel_id,
+                    review_approved_channel_id = excluded.review_approved_channel_id,
+                    review_declined_channel_id = excluded.review_declined_channel_id
                 """,
                 (
                     guild_id,
@@ -284,6 +300,9 @@ class ModerationDatabase:
                     merged["vt_malicious_threshold"],
                     merged["vt_suspicious_threshold"],
                     merged["mod_embed_delete_after_seconds"],
+                    merged["review_inbox_channel_id"],
+                    merged["review_approved_channel_id"],
+                    merged["review_declined_channel_id"],
                 ),
             )
             await db.commit()
@@ -548,6 +567,64 @@ class ModerationDatabase:
             row = await cur.fetchone()
             await db.commit()
         return int(row[0]) if row else 1
+
+    async def set_user_heat(
+        self,
+        guild_id: int,
+        user_id: int,
+        modifier: int,
+        *,
+        expires_at_iso: Optional[str] = None,
+        set_by_id: Optional[int] = None,
+        reason: str = "",
+    ) -> None:
+        """Setzt den Heat-Modifier für einen Nutzer (+N = stärker beobachten, -N = Visier entfernen)."""
+        ts = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO user_heat (guild_id, user_id, heat_modifier, expires_at_iso, set_by_id, reason, updated_at_iso)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                    heat_modifier = excluded.heat_modifier,
+                    expires_at_iso = excluded.expires_at_iso,
+                    set_by_id = excluded.set_by_id,
+                    reason = excluded.reason,
+                    updated_at_iso = excluded.updated_at_iso
+                """,
+                (guild_id, user_id, modifier, expires_at_iso, set_by_id, reason[:500], ts),
+            )
+            await db.commit()
+
+    async def get_user_heat_modifier(self, guild_id: int, user_id: int) -> int:
+        """Gibt den aktiven Heat-Modifier zurück (0 wenn abgelaufen oder nicht gesetzt)."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                """
+                SELECT heat_modifier, expires_at_iso FROM user_heat
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return 0
+        modifier, expires = int(row[0]), row[1]
+        if expires is not None and str(expires) < now_iso:
+            return 0
+        return modifier
+
+    async def clear_expired_heat(self, guild_id: int) -> int:
+        """Entfernt abgelaufene Heat-Einträge; gibt Anzahl entfernter Zeilen zurück."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._db_path) as db:
+            cur = await db.execute(
+                "DELETE FROM user_heat WHERE guild_id = ? AND expires_at_iso IS NOT NULL AND expires_at_iso < ?",
+                (guild_id, now_iso),
+            )
+            await db.commit()
+            return cur.rowcount or 0
 
     async def get_user_strikes(self, guild_id: int, user_id: int) -> int:
         async with aiosqlite.connect(self._db_path) as db:
@@ -838,6 +915,9 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         ("vt_malicious_threshold", "INTEGER NOT NULL DEFAULT 1"),
         ("vt_suspicious_threshold", "INTEGER NOT NULL DEFAULT 3"),
         ("mod_embed_delete_after_seconds", "INTEGER"),
+        ("review_inbox_channel_id", "INTEGER"),
+        ("review_approved_channel_id", "INTEGER"),
+        ("review_declined_channel_id", "INTEGER"),
     ]
     for name, decl in alters:
         if name not in cols:
@@ -861,6 +941,21 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
     rq_cols = {str(r[1]) for r in await cur.fetchall()}
     if "case_ref" not in rq_cols:
         await db.execute("ALTER TABLE review_queue ADD COLUMN case_ref TEXT")
+
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_heat (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            heat_modifier INTEGER NOT NULL DEFAULT 0,
+            expires_at_iso TEXT,
+            set_by_id INTEGER,
+            reason TEXT,
+            updated_at_iso TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
 
     _old_rules_placeholder = (
         "(Noch keine Regeln gesetzt — nutze /mod-config um Verhaltensregeln zu hinterlegen.)"
@@ -893,6 +988,9 @@ def _default_guild_config(guild_id: int) -> dict[str, Any]:
         "vt_malicious_threshold": 1,
         "vt_suspicious_threshold": 3,
         "mod_embed_delete_after_seconds": None,
+        "review_inbox_channel_id": None,
+        "review_approved_channel_id": None,
+        "review_declined_channel_id": None,
     }
 
 
@@ -938,6 +1036,15 @@ def _row_to_guild_config(row: dict[str, Any]) -> dict[str, Any]:
         "vt_suspicious_threshold": int(r.get("vt_suspicious_threshold", 3)),
         "mod_embed_delete_after_seconds": int(m)
         if (m := r.get("mod_embed_delete_after_seconds")) is not None
+        else None,
+        "review_inbox_channel_id": int(ri)
+        if (ri := r.get("review_inbox_channel_id")) is not None
+        else None,
+        "review_approved_channel_id": int(ra)
+        if (ra := r.get("review_approved_channel_id")) is not None
+        else None,
+        "review_declined_channel_id": int(rd)
+        if (rd := r.get("review_declined_channel_id")) is not None
         else None,
     }
 
@@ -1031,6 +1138,17 @@ CREATE TABLE IF NOT EXISTS user_strikes (
     guild_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     strikes INTEGER NOT NULL DEFAULT 0,
+    updated_at_iso TEXT NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_heat (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    heat_modifier INTEGER NOT NULL DEFAULT 0,
+    expires_at_iso TEXT,
+    set_by_id INTEGER,
+    reason TEXT,
     updated_at_iso TEXT NOT NULL,
     PRIMARY KEY (guild_id, user_id)
 );

@@ -37,21 +37,6 @@ def icon_for_decision(decision_value: str) -> str:
     return mapping.get(decision_value, "info")
 
 
-def get_icon_file(name: str) -> Optional[discord.File]:
-    """
-    Gibt ein frisches discord.File für den Icon-Namen zurück, oder None falls
-    die Datei nicht existiert. Jeder Aufruf öffnet die Datei neu (Discord
-    verbraucht das File-Objekt beim Senden).
-    """
-    filename = ICON_NAMES.get(name)
-    if not filename:
-        return None
-    path = _ICONS_DIR / filename
-    if not path.exists():
-        return None
-    return discord.File(str(path), filename=filename)
-
-
 def attach_thumbnail(embed: discord.Embed, name: str) -> Optional[discord.File]:
     """
     Setzt das Thumbnail des Embeds auf attachment://<dateiname> und gibt

@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import discord
@@ -52,17 +52,37 @@ class ModerationCog(commands.Cog):
     def __init__(self, bot: ModerationBot) -> None:
         self.bot = bot
         self._worker_task: Optional[asyncio.Task] = None
+        self._heat_cleanup_task: Optional[asyncio.Task] = None
 
     async def cog_load(self) -> None:
         self._worker_task = asyncio.create_task(self._moderation_worker())
+        self._heat_cleanup_task = asyncio.create_task(self._heat_cleanup_loop())
 
     async def cog_unload(self) -> None:
-        if self._worker_task:
-            self._worker_task.cancel()
-            try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._worker_task, self._heat_cleanup_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _heat_cleanup_loop(self) -> None:
+        """Räumt abgelaufene Heat-Einträge alle 6 Stunden auf."""
+        await asyncio.sleep(300)  # kurzer Verzögerungsstart nach Bot-Start
+        while True:
+            db = self.bot.db
+            if db is not None:
+                try:
+                    guilds = self.bot.guilds
+                    total = 0
+                    for guild in guilds:
+                        total += await db.clear_expired_heat(guild.id)
+                    if total:
+                        logger.info("Heat-Cleanup: %d abgelaufene Einträge entfernt.", total)
+                except Exception:
+                    logger.exception("Heat-Cleanup fehlgeschlagen.")
+            await asyncio.sleep(6 * 3600)
 
     async def _moderation_worker(self) -> None:
         q = self.bot.moderation_queue
@@ -215,10 +235,19 @@ class ModerationCog(commands.Cog):
         if not gcfg["ai_enabled"]:
             return
 
+        # Heat-Modifier: +N = strenger beobachten (Schwelle senken), -N = lockerer (Schwelle heben)
+        heat_mod = await db.get_user_heat_modifier(message.guild.id, message.author.id)
+        base_thr = int(gcfg["confidence_threshold"])
+        thr = max(0, min(99, base_thr - heat_mod))
+        if heat_mod != 0:
+            logger.debug(
+                "Heat-Modifier %+d für User %s → Schwelle %d→%d",
+                heat_mod, message.author.id, base_thr, thr,
+            )
+
         ctx_limit = settings.context_message_count
         recent = await db.fetch_recent_messages(message.channel.id, ctx_limit)
         warnings_block = await db.fetch_recent_warnings_text(message.guild.id, message.author.id)
-        thr = int(gcfg["confidence_threshold"])
 
         system_prompt = MODERATOR_AI_SYSTEM_PROMPT.format(
             server_rules=gcfg["server_rules"],
@@ -241,6 +270,48 @@ class ModerationCog(commands.Cog):
         except Exception:
             logger.exception("Moderations-API fehlgeschlagen für Message %s", message.id)
             return
+
+        if decision.moderation_decision == ModerationDecision.ALLOW:
+            return
+
+        # Kontextneuprüfung: bei warn/delete mit niedriger Confidence könnten
+        # Witze oder Ironie fehlinterpretiert worden sein → mehr Kontext laden
+        # Bei negativem Heat-Modifier (Visier entfernen) Recheck immer erzwingen
+        recheck_thr = settings.context_recheck_confidence
+        needs_recheck = (
+            decision.moderation_decision in (ModerationDecision.WARN, ModerationDecision.DELETE)
+            and (decision.confidence < recheck_thr or heat_mod < 0)
+        )
+        if needs_recheck:
+            ext_limit = settings.context_message_count_extended
+            if ext_limit > ctx_limit:
+                extended_recent = await db.fetch_recent_messages(message.channel.id, ext_limit)
+                ext_system_prompt = MODERATOR_AI_SYSTEM_PROMPT.format(
+                    server_rules=gcfg["server_rules"],
+                    context_block=self._format_context(extended_recent, warnings_block, message),
+                )
+                try:
+                    async def _call_ext() -> ClaudeModerationResponse:
+                        return await ai.moderate(
+                            system_prompt=ext_system_prompt,
+                            user_payload=user_payload,
+                            guild_confidence_threshold=thr,
+                        )
+
+                    ext_decision = await breaker.call(_call_ext)
+                    logger.info(
+                        "Kontextneuprüfung (msg %s): %s→%s conf=%s→%s",
+                        message.id,
+                        decision.moderation_decision.value,
+                        ext_decision.moderation_decision.value,
+                        decision.confidence,
+                        ext_decision.confidence,
+                    )
+                    decision = ext_decision
+                except CircuitOpenError:
+                    logger.warning("Anthropic-Circuit offen — Neuprüfung übersprungen (msg %s).", message.id)
+                except Exception:
+                    logger.exception("Kontextneuprüfung fehlgeschlagen für Message %s", message.id)
 
         if decision.moderation_decision == ModerationDecision.ALLOW:
             return
@@ -317,16 +388,17 @@ class ModerationCog(commands.Cog):
         case_ref: Optional[str] = None,
         event_ref: Optional[str] = None,
     ) -> None:
-        cid = gcfg.get("mod_log_channel_id")
+        # Dedizierter Review-Eingangskanal; Fallback auf mod_log_channel_id
+        cid = gcfg.get("review_inbox_channel_id") or gcfg.get("mod_log_channel_id")
         if not cid:
-            logger.warning("Review-Queue ohne mod_log_channel — Queue-ID %s.", queue_id)
+            logger.warning("Review-Queue ohne Kanal — Queue-ID %s.", queue_id)
             return
         guild = message.guild
         ch = guild.get_channel(int(cid))
         if not isinstance(ch, discord.TextChannel):
             return
 
-        title = f"Moderation: Manuelle Freigabe{f' · `{case_ref}`' if case_ref else ''}"
+        title = f"🔍 Review erforderlich{f' · `{case_ref}`' if case_ref else ''}"
         embed = discord.Embed(
             title=title,
             description=f"[Zur Nachricht]({message.jump_url})",
@@ -343,14 +415,19 @@ class ModerationCog(commands.Cog):
             embed.add_field(name="Fall-ID", value=f"`{case_ref}`", inline=True)
         if event_ref:
             embed.add_field(name="Ereignis-ID", value=f"`{event_ref}`", inline=True)
+        embed.add_field(
+            name="Nachricht (Vorschau)",
+            value=(message.content or "—")[:512],
+            inline=False,
+        )
         foot = f"ModeratorAI · Review · queue_id={queue_id}"
         embed.set_footer(text=foot)
         embed.timestamp = discord.utils.utcnow()
 
         view = ReviewView(self.bot, queue_id)
-        delete_after = self._resolve_embed_delete_after(gcfg)
+        # Review-Nachrichten dürfen sich NICHT selbst löschen
         try:
-            await ch.send(embed=embed, view=view, delete_after=delete_after)
+            await ch.send(embed=embed, view=view)
         except discord.HTTPException:
             logger.exception("Konnte Review-Embed nicht senden.")
 
@@ -487,18 +564,54 @@ class ModerationCog(commands.Cog):
         warnings_block: str,
         message: discord.Message,
     ) -> str:
+        author_id = message.author.id
+        author_tag = f"{message.author} (ID {author_id})"
+        now_utc = message.created_at.astimezone(timezone.utc)
+
         lines: list[str] = []
-        lines.append("#### Verwarnungen (Nutzer)")
+        lines.append(
+            f"#### Verwarnungen für **{author_tag}** (nur dieser Nutzer — nicht andere)"
+        )
         lines.append(warnings_block)
         lines.append("")
-        lines.append("#### Letzte Channel-Nachrichten (chronologisch, inkl. aktueller Eintrag)")
+        lines.append(
+            "#### Letzte Channel-Nachrichten (chronologisch; "
+            f"Nachrichten von **{author_tag}** sind mit [DIESER NUTZER] markiert)"
+        )
         for m in recent:
-            mark = " **← zu prüfend**" if m.message_id == message.id else ""
+            is_author = m.author_id == author_id
+            is_target = m.message_id == message.id
+
+            author_mark = " **[DIESER NUTZER]**" if is_author and not is_target else ""
+            target_mark = " **← ZU PRÜFEN**" if is_target else ""
             ev = f" `{m.event_ref}`" if getattr(m, "event_ref", None) else ""
+
+            # Zeitdifferenz berechnen damit Claude alte Nachrichten einordnen kann
+            try:
+                msg_dt = datetime.fromisoformat(m.created_at_iso)
+                if msg_dt.tzinfo is None:
+                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                age_h = (now_utc - msg_dt).total_seconds() / 3600
+                if age_h > 48:
+                    age_str = f" [vor {age_h / 24:.0f}d]"
+                elif age_h > 1:
+                    age_str = f" [vor {age_h:.0f}h]"
+                else:
+                    age_str = ""
+            except Exception:
+                age_str = ""
+
             lines.append(
-                f"- [{m.created_at_iso}]{ev} {m.author_name} (ID {m.author_id}): "
-                f"{m.content[:500]}{mark}",
+                f"- [{m.created_at_iso}]{age_str}{ev} "
+                f"{m.author_name} (ID {m.author_id}){author_mark}{target_mark}: "
+                f"{m.content[:500]}",
             )
+        lines.append("")
+        lines.append(
+            f"**Wichtig:** Beziehe alle Verwarnungen und vergangenen Nachrichten "
+            f"ausschließlich auf **{author_tag}**. "
+            "Nachrichten anderer Nutzer im Kanal dienen nur als Gesprächskontext."
+        )
         return "\n".join(lines)
 
     async def _execute_decision(
@@ -551,12 +664,7 @@ class ModerationCog(commands.Cog):
 
         try:
             if d.moderation_decision == ModerationDecision.WARN:
-                await self._send_user_notice(
-                    message,
-                    d.user_facing_message or d.reason,
-                    decision=d.moderation_decision,
-                    violated_rule_ids=d.violated_rule_ids,
-                )
+                # Warn: kein DM — nur Mod-Log, um DM-Flooding zu vermeiden
                 await db.add_warning(
                     guild.id,
                     message.author.id,
@@ -724,6 +832,7 @@ class ModerationCog(commands.Cog):
             text,
             decision,
             violated_rule_ids=violated_rule_ids,
+            message_content=message.content or None,
         )
         member = message.author
         try:
@@ -850,8 +959,17 @@ class ReviewView(discord.ui.View):
             await interaction.followup.send("Moderations-Cog fehlt.", ephemeral=True)
             return
 
+        gcfg = await db.get_guild_config(entry.guild_id)
+
         if action == "dismiss":
             await db.update_review_queue_status(self.queue_id, "resolved_dismissed")
+            await self._post_outcome(
+                interaction, gcfg, entry,
+                approved=False,
+                moderator=interaction.user,
+                action_label="Abgelehnt — keine Maßnahme",
+                case_ref=entry.case_ref,
+            )
             await interaction.followup.send("Meldung abgelehnt (keine Aktion).", ephemeral=True)
             return
 
@@ -878,13 +996,65 @@ class ReviewView(discord.ui.View):
             message, eff, case_ref=entry.case_ref
         )
         await db.update_review_queue_status(self.queue_id, "resolved_applied")
+        await self._post_outcome(
+            interaction, gcfg, entry,
+            approved=True,
+            moderator=interaction.user,
+            action_label=f"Bestätigt — {eff.moderation_decision.value}",
+            case_ref=entry.case_ref,
+        )
         await interaction.followup.send("Aktion ausgeführt.", ephemeral=True)
 
+    async def _post_outcome(
+        self,
+        interaction: discord.Interaction,
+        gcfg: dict,
+        entry: Any,
+        *,
+        approved: bool,
+        moderator: discord.Member,
+        action_label: str,
+        case_ref: Optional[str],
+    ) -> None:
+        """Sendet permanente Ergebnis-Nachricht in approved/declined Kanal und löscht die Review-Msg."""
+        if interaction.guild is None:
+            return
+
+        outcome_cid = (
+            gcfg.get("review_approved_channel_id") if approved
+            else gcfg.get("review_declined_channel_id")
+        )
+        # Fallback auf mod_log_channel wenn kein Ergebniskanal gesetzt
+        outcome_cid = outcome_cid or gcfg.get("mod_log_channel_id")
+
+        if outcome_cid:
+            ch = interaction.guild.get_channel(int(outcome_cid))
+            if isinstance(ch, discord.TextChannel):
+                color = discord.Color.green() if approved else discord.Color.greyple()
+                emb = discord.Embed(
+                    title=f"{'✅ Review bestätigt' if approved else '❌ Review abgelehnt'}"
+                          f"{f' · `{case_ref}`' if case_ref else ''}",
+                    color=color,
+                )
+                emb.add_field(name="Betroffener Nutzer", value=f"<@{entry.author_id}> (`{entry.author_id}`)", inline=True)
+                emb.add_field(name="Ergebnis", value=action_label, inline=True)
+                emb.add_field(name="Moderator", value=f"{moderator} (`{moderator.id}`)", inline=True)
+                if entry.jump_url:
+                    emb.add_field(name="Nachricht", value=f"[Im Kanal öffnen]({entry.jump_url})", inline=False)
+                emb.set_footer(text=f"ModeratorAI · Review-Ergebnis · queue_id={self.queue_id}")
+                emb.timestamp = discord.utils.utcnow()
+                try:
+                    await ch.send(embed=emb)
+                except discord.HTTPException:
+                    logger.warning("Konnte Review-Ergebnis nicht senden.")
+
+        # Review-Embed mit deaktivierten Buttons bearbeiten, dann löschen
         for child in self.children:
-            child.disabled = True
+            child.disabled = True  # type: ignore[attr-defined]
         try:
             if interaction.message:
                 await interaction.message.edit(view=self)
+                await interaction.message.delete()
         except discord.HTTPException:
             pass
 

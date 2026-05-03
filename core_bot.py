@@ -70,7 +70,7 @@ class ModerationBot(commands.Bot):
             self.vt_client = VirusTotalClient(self.settings.virustotal_api_key)
             self.vt_url_cache = TTLCache(maxsize=2_000, ttl=300.0)
 
-        for ext in ("cogs.moderation", "cogs.admin"):
+        for ext in ("cogs.moderation", "cogs.admin", "cogs.settings_panel"):
             try:
                 await self.load_extension(ext)
             except Exception:
