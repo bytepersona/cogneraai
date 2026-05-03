@@ -720,7 +720,7 @@ class ModerationCog(commands.Cog):
     ) -> None:
         if not text:
             return
-        embed = build_user_notice_embed(
+        embed, icon_file = build_user_notice_embed(
             text,
             decision,
             violated_rule_ids=violated_rule_ids,
@@ -728,14 +728,15 @@ class ModerationCog(commands.Cog):
         member = message.author
         try:
             if isinstance(member, discord.Member):
-                await member.send(embed=embed)
+                await member.send(embed=embed, files=[icon_file] if icon_file else [])
             else:
-                await message.author.send(embed=embed)
+                await message.author.send(embed=embed, files=[icon_file] if icon_file else [])
         except discord.Forbidden:
             try:
                 await message.channel.send(
                     content=message.author.mention,
                     embed=embed,
+                    files=[icon_file] if icon_file else [],
                     delete_after=120,
                 )
             except discord.HTTPException:
